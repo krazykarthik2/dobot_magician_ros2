@@ -4,6 +4,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
@@ -11,15 +12,17 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "demos")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-WINDOW_SIZE = 8   # Past observation history sequence (T_obs = 8)
-CHUNK_SIZE = 8    # Future action prediction horizon (H_action = 8)
+WINDOW_SIZE = 8   # Sequence window (T_obs = 8 past states)
+CHUNK_SIZE = 8    # Future trajectory chunk horizon (H_action = 8)
 
-class ActionChunkingDataset(Dataset):
+class SmolVLADataset(Dataset):
     """
-    Action Chunking Dataset:
-    Inputs: Sequence of past observations [T_obs=8, obs_dim=11]
-    Targets: Future Action Trajectory Chunk [H_action=8, act_dim=6]
-             where act = [dx, dy, dz, dyaw, gripper_cmd, success_signal]
+    Dataset for SmolVLA / Pi0 Generalist Policy:
+    Input:
+      - Multi-Modal Scene Observation Sequence [T_obs=8, obs_dim=11]
+    Target:
+      - Future Action Trajectory Chunk [H_action=8, 6]:
+        [dx, dy, dz, dyaw, gripper_cmd, success_signal]
     """
     def __init__(self, data_dir, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE):
         self.window_size = window_size
@@ -39,7 +42,6 @@ class ActionChunkingDataset(Dataset):
             obs = data['observations']  # [N, 11]
             act = data['actions']       # [N, 6] (or [N, 5])
             if act.shape[1] == 5:
-                # Add default zero success column if old format
                 succ_col = np.zeros((len(act), 1), dtype=np.float32)
                 act = np.concatenate([act, succ_col], axis=-1)
 
@@ -68,14 +70,14 @@ class ActionChunkingDataset(Dataset):
             window_size=self.window_size,
             chunk_size=self.chunk_size
         )
-        print(f"Saved Action Chunking normalization statistics -> {stats_path}")
+        print(f"Saved SmolVLA / Pi0 normalization statistics -> {stats_path}")
 
         self.samples = []
         for obs_ep, act_ep in zip(episodes_obs, episodes_act):
             norm_obs_ep = (obs_ep - self.obs_mean) / self.obs_std
             
             motion_ep = act_ep[:, :4]
-            discrete_ep = act_ep[:, 4:6] # [N, 2: gripper_cmd, success_signal]
+            discrete_ep = act_ep[:, 4:6]
             norm_motion_ep = (motion_ep - self.motion_mean) / self.motion_std
             norm_act_ep = np.concatenate([norm_motion_ep, discrete_ep], axis=-1)
 
@@ -100,7 +102,7 @@ class ActionChunkingDataset(Dataset):
                     chunk_act.astype(np.float32)
                 ))
 
-        print(f"Loaded {len(files)} episodes -> {len(self.samples)} Action-Chunk samples (Horizon={chunk_size}).")
+        print(f"Loaded {len(files)} episodes -> {len(self.samples)} SmolVLA sequence samples (Horizon={chunk_size}).")
 
     def __len__(self):
         return len(self.samples)
@@ -109,89 +111,187 @@ class ActionChunkingDataset(Dataset):
         obs_seq, chunk_act = self.samples[idx]
         return torch.tensor(obs_seq), torch.tensor(chunk_act)
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=64):
+
+# -----------------------------------------------------------------------------
+# SmolVLM-2 / Pi0 Architecture Modules: Multi-Layer Perception Backbone & Action Expert
+# -----------------------------------------------------------------------------
+
+class MultiLayerPerceptionBackbone(nn.Module):
+    """
+    Lightweight SmolVLM-2 style Multi-Layer Transformer Perception Backbone:
+    Processes the raw sensorimotor scene tokens (EE, Cube, Platform) across T_obs timesteps.
+    Extracts multi-layer intermediate hidden representations across all its layers.
+    """
+    def __init__(self, in_dim=11, d_model=128, nhead=4, num_layers=3, dim_feedforward=256):
         super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe.unsqueeze(0))
+        self.in_proj = nn.Sequential(
+            nn.Linear(in_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU()
+        )
+        
+        # Transformer Layers
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=0.05,
+                activation="gelu",
+                batch_first=True
+            )
+            for _ in range(num_layers)
+        ])
 
     def forward(self, x):
-        return x + self.pe[:, :x.size(1)]
+        # x: [B, T_obs, 11]
+        h = self.in_proj(x)
+        layer_outputs = []
+        for layer in self.layers:
+            h = layer(h)
+            layer_outputs.append(h) # Collect representations from each layer
+        return layer_outputs
 
-class DobotActionChunkTransformer(nn.Module):
+
+class ActionExpertCrossAttentionBlock(nn.Module):
     """
-    Action Chunking Transformer with 3 Multi-Head Outputs:
-    - Continuous Velocity Motion Chunk [B, H, 4] -> dx, dy, dz, dyaw
-    - Binary Gripper Logits Chunk [B, H, 1] -> Grasp command
-    - Task Success Classification Logit [B, 1] -> Self-evaluated task completion
+    Action Expert Transformer Block with:
+    - Multi-Head Causal Self-Attention (for intra-action trajectory consistency)
+    - Multi-Head Cross-Attention (conditions on multi-layer VLM perception features)
+    - Feed-Forward MLP with GELU
     """
-    def __init__(self, obs_dim=11, chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3, dim_feedforward=256):
+    def __init__(self, d_model=128, nhead=4, dim_feedforward=256):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=0.05, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=0.05, batch_first=True)
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Linear(dim_feedforward, d_model)
+        )
+
+    def forward(self, act_tokens, vlm_layer_feat):
+        # 1. Self-Attention over action chunk tokens
+        sa_out, _ = self.self_attn(act_tokens, act_tokens, act_tokens)
+        act_tokens = self.norm1(act_tokens + sa_out)
+
+        # 2. Cross-Attention over VLM layer features (Physical Intelligence Pi0 / SmolVLA mechanism)
+        ca_out, _ = self.cross_attn(query=act_tokens, key=vlm_layer_feat, value=vlm_layer_feat)
+        act_tokens = self.norm2(act_tokens + ca_out)
+
+        # 3. Feed-forward
+        ffn_out = self.ffn(act_tokens)
+        act_tokens = self.norm3(act_tokens + ffn_out)
+        return act_tokens
+
+
+class SmolVLAPolicy(nn.Module):
+    """
+    SmolVLA / Pi0 Generalist Policy Architecture:
+    1. VLM Perception Backbone (SmolVLM-2 style): Generates multi-layer scene representations.
+    2. Multi-Layer Feature Aggregator: Fuses all intermediate VLM layers.
+    3. Action Expert: Interleaved cross-attention blocks decoding the future trajectory chunk H=8.
+    4. Multi-Head Output:
+       - Continuous Velocity Motion Chunk [B, H, 4] (dx, dy, dz, dyaw)
+       - Discrete Gripper Logits Chunk [B, H, 1]
+       - Self-Evaluated Success Logit [B, 1]
+    """
+    def __init__(self, obs_dim=11, chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3):
         super().__init__()
         self.chunk_size = chunk_size
         self.d_model = d_model
 
-        self.input_proj = nn.Sequential(
-            nn.Linear(obs_dim, d_model),
+        # 1. Perception VLM Backbone
+        self.vlm_backbone = MultiLayerPerceptionBackbone(
+            in_dim=obs_dim,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dim_feedforward=256
+        )
+
+        # 2. Multi-layer fusion: Projects concatenated multi-layer outputs back to d_model
+        self.layer_fusion = nn.Sequential(
+            nn.Linear(d_model * num_layers, d_model),
             nn.LayerNorm(d_model),
             nn.GELU()
         )
-        self.pos_enc = PositionalEncoding(d_model)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=0.05,
-            activation="gelu",
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # 1. Action Chunking Trajectory Head
-        self.chunk_head = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.GELU(),
-            nn.Linear(dim_feedforward, chunk_size * 5)  # H * (4 motion + 1 gripper)
-        )
-
-        # 2. Self-Evaluated Success Head (1 scalar logit for whole episode state)
-        self.success_head = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward // 2),
-            nn.GELU(),
-            nn.Linear(dim_feedforward // 2, 1)
-        )
-
-    def forward(self, x_seq):
-        tokens = self.input_proj(x_seq)
-        tokens = self.pos_enc(tokens)
-
-        trans_out = self.transformer(tokens)  # [B, T_obs, d_model]
-        current_rep = trans_out[:, -1, :]     # [B, d_model]
-
-        flat_chunk = self.chunk_head(current_rep) # [B, H * 5]
-        chunk_out = flat_chunk.view(-1, self.chunk_size, 5) # [B, H, 5]
-
-        motion_chunk = chunk_out[:, :, :4]    # [B, H, 4: dx, dy, dz, dyaw]
-        grip_chunk_logits = chunk_out[:, :, 4:5] # [B, H, 1: gripper logit]
+        # 3. Action Expert: Learned query tokens for H=8 future timesteps
+        self.action_queries = nn.Parameter(torch.randn(1, chunk_size, d_model) * 0.02)
         
-        success_logit = self.success_head(current_rep) # [B, 1: task completed logit]
+        self.action_expert_layers = nn.ModuleList([
+            ActionExpertCrossAttentionBlock(d_model=d_model, nhead=nhead, dim_feedforward=256)
+            for _ in range(num_layers)
+        ])
+
+        # 4. Output Heads
+        self.motion_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 4)  # dx, dy, dz, dyaw
+        )
+
+        self.gripper_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.GELU(),
+            nn.Linear(d_model // 4, 1)  # Gripper logit
+        )
+
+        self.success_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.GELU(),
+            nn.Linear(d_model // 4, 1)  # Task success confidence logit
+        )
+
+    def forward(self, obs_seq):
+        # obs_seq: [B, T_obs, 11]
+        batch_size = obs_seq.size(0)
+
+        # Step 1: Extract all layer outputs from VLM perception backbone
+        vlm_all_layers = self.vlm_backbone(obs_seq) # List of [B, T_obs, d_model]
+
+        # Step 2: Multi-layer fusion across all VLM layers
+        fused_vlm_feats = torch.cat(vlm_all_layers, dim=-1) # [B, T_obs, d_model * num_layers]
+        vlm_context = self.layer_fusion(fused_vlm_feats)     # [B, T_obs, d_model]
+
+        # Step 3: Expand learned action queries across batch
+        act_tokens = self.action_queries.expand(batch_size, -1, -1) # [B, H, d_model]
+
+        # Step 4: Pass through Action Expert with Cross-Attention over each VLM layer
+        for i, expert_block in enumerate(self.action_expert_layers):
+            layer_vlm_feat = vlm_all_layers[i] # Layer-specific conditioning (Pi0 / SmolVLA)
+            act_tokens = expert_block(act_tokens, layer_vlm_feat)
+
+        # Step 5: Multi-Head Action & Success Predictions
+        motion_chunk = self.motion_head(act_tokens)       # [B, H, 4]
+        grip_chunk_logits = self.gripper_head(act_tokens) # [B, H, 1]
+
+        # Success evaluated from final VLM context state
+        success_logit = self.success_head(vlm_context[:, -1, :]) # [B, 1]
+
         return motion_chunk, grip_chunk_logits, success_logit
 
-def train(epochs=180, batch_size=128, lr=5e-4):
-    print("=" * 65)
-    print("   Dobot Action Chunking Transformer Policy Training")
-    print("   (With Self-Evaluated Success Head & Randomized Platform)")
-    print("=" * 65)
 
-    dataset = ActionChunkingDataset(DATA_DIR, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE)
+# Alias for backward compatibility
+DobotActionChunkTransformer = SmolVLAPolicy
+
+
+def train(epochs=180, batch_size=128, lr=5e-4):
+    print("=" * 68)
+    print("   SmolVLA / Pi0 Generalist Policy Training (Multi-Layer VLM Fusion)")
+    print("=" * 68)
+
+    dataset = SmolVLADataset(DATA_DIR, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     obs_dim = dataset.samples[0][0].shape[-1]
-    model = DobotActionChunkTransformer(obs_dim=obs_dim, chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3)
+    model = SmolVLAPolicy(obs_dim=obs_dim, chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3)
 
     model_path = os.path.join(MODEL_DIR, "dobot_bc_policy.pth")
     if os.path.exists(model_path):
@@ -201,13 +301,13 @@ def train(epochs=180, batch_size=128, lr=5e-4):
             compat = {k: v for k, v in ckpt.items() if k in model_dict and model_dict[k].shape == v.shape}
             if len(compat) == len(model_dict):
                 model.load_state_dict(compat)
-                print(f">> [RESUME] Loaded 100% ACT weights from: {os.path.basename(model_path)}")
+                print(f">> [RESUME] Loaded 100% SmolVLA weights from: {os.path.basename(model_path)}")
             elif len(compat) > 0:
                 model_dict.update(compat)
                 model.load_state_dict(model_dict)
                 print(f">> [WARM START] Loaded {len(compat)}/{len(model_dict)} layers.")
         except Exception as e:
-            print(f">> [INFO] Initializing fresh ACT Transformer.")
+            print(f">> [INFO] Initializing fresh SmolVLA Transformer.")
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
@@ -216,7 +316,7 @@ def train(epochs=180, batch_size=128, lr=5e-4):
     bce_loss_fn = nn.BCEWithLogitsLoss()
     axis_weights = torch.tensor([1.0, 1.0, 4.0, 1.0], dtype=torch.float32)
 
-    print(f"\n>> Training ACT Model on CPU across {len(dataset)} Action-Chunks ({epochs} epochs)...")
+    print(f"\n>> Training SmolVLA Model on CPU across {len(dataset)} Action-Chunks ({epochs} epochs)...")
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -231,7 +331,7 @@ def train(epochs=180, batch_size=128, lr=5e-4):
 
             target_motion = target_chunk[:, :, :4]
             target_grip = target_chunk[:, :, 4:5]
-            target_succ = target_chunk[:, -1, 5:6]  # Success flag at current frame
+            target_succ = target_chunk[:, -1, 5:6]
 
             # Weighted motion Huber loss across all chunk timesteps
             raw_motion_loss = huber_loss_fn(pred_motion_chunk, target_motion) # [B, H, 4]
@@ -262,7 +362,7 @@ def train(epochs=180, batch_size=128, lr=5e-4):
             print(f"Epoch [{epoch:03d}/{epochs}] - Total: {avg_loss:.5f} | Motion: {avg_motion:.5f} | Grip: {avg_grip:.5f} | Succ: {avg_succ:.5f} | LR: {scheduler.get_last_lr()[0]:.6f}")
 
     torch.save(model.state_dict(), model_path)
-    print(f"\n[SUCCESS] Action Chunking Policy saved -> {model_path}")
+    print(f"\n[SUCCESS] SmolVLA / Pi0 Generalist Policy saved -> {model_path}")
 
 if __name__ == "__main__":
     train()

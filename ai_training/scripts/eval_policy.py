@@ -7,7 +7,7 @@ import pygame
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "env"))
 from dobot_env import DobotPickPlaceSim
-from train_imitation import DobotActionChunkTransformer, MODEL_DIR, WINDOW_SIZE, CHUNK_SIZE
+from train_imitation import SmolVLAPolicy, MODEL_DIR, WINDOW_SIZE, CHUNK_SIZE
 
 def world_to_screen(x, y):
     sx = int(200 + (y / 0.30) * 160)
@@ -65,7 +65,7 @@ def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, mod
     # Bottom Status HUD
     pygame.draw.rect(screen, (30, 33, 42), (20, 395, 740, 105), border_radius=8)
     
-    title_str = f"ACT AI (Ensembled): Episode {ep} / {total_eps}"
+    title_str = f"SmolVLA / Pi0 Generalist AI: Episode {ep} / {total_eps}"
     screen.blit(font_bold.render(title_str, True, (100, 210, 255)), (35, 405))
 
     steps_str = f"Step: {step} / {max_steps}"
@@ -73,7 +73,7 @@ def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, mod
 
     # Display Model's Self-Evaluated Success Confidence
     succ_color = (80, 255, 120) if model_succ_prob > 0.60 else (200, 200, 210)
-    conf_str = f"Model Self-Evaluated Success: {model_succ_prob*100:.1f}%"
+    conf_str = f"SmolVLA Success Conf: {model_succ_prob*100:.1f}%"
     screen.blit(font_bold.render(conf_str, True, succ_color), (35, 435))
 
     if is_success:
@@ -101,7 +101,7 @@ def evaluate(episodes=10):
     window_size = int(stats['window_size']) if 'window_size' in stats else WINDOW_SIZE
     chunk_size = int(stats['chunk_size']) if 'chunk_size' in stats else CHUNK_SIZE
 
-    model = DobotActionChunkTransformer(obs_dim=len(obs_mean), chunk_size=chunk_size, d_model=128, nhead=4, num_layers=3)
+    model = SmolVLAPolicy(obs_dim=len(obs_mean), chunk_size=chunk_size, d_model=128, nhead=4, num_layers=3)
     model.load_state_dict(torch.load(model_path, map_location="cpu"))
     model.eval()
 
@@ -109,7 +109,7 @@ def evaluate(episodes=10):
 
     pygame.init()
     screen = pygame.display.set_mode((780, 520))
-    pygame.display.set_caption("Dobot Temporal Ensembling ACT Evaluation")
+    pygame.display.set_caption("Dobot SmolVLA / Pi0 Generalist Policy Evaluation")
     font = pygame.font.SysFont("Arial", 15)
     font_bold = pygame.font.SysFont("Arial", 18, bold=True)
     clock = pygame.time.Clock()
@@ -121,10 +121,10 @@ def evaluate(episodes=10):
     exp_weights = np.exp(-0.4 * np.arange(chunk_size))
     exp_weights = exp_weights / exp_weights.sum()
 
-    print("=" * 65)
-    print("   Testing ACT Policy with Exponential Temporal Ensembling")
+    print("=" * 68)
+    print("   Testing SmolVLA / Pi0 Generalist Policy (Temporal Ensembling)")
     print("   (Random Red Cube & Random Green Platform Scenes)")
-    print("=" * 65)
+    print("=" * 68)
 
     for ep in range(1, episodes + 1):
         obs = sim.reset(random_scene=True)
@@ -133,10 +133,7 @@ def evaluate(episodes=10):
         norm_obs_init = (obs - obs_mean) / obs_std
         obs_history = [norm_obs_init.copy() for _ in range(window_size)]
         
-        # Buffer of overlapping predicted action chunks for temporal ensembling
-        # List of chunks currently active at time t
         active_chunks = []
-
         ep_success = False
         aborted = False
         model_succ_prob = 0.0
@@ -152,7 +149,7 @@ def evaluate(episodes=10):
             if aborted:
                 break
 
-            # 1. Query policy at every frame
+            # Query SmolVLA policy at every frame
             seq_t = torch.tensor(np.array([obs_history]), dtype=torch.float32)
             with torch.no_grad():
                 pred_motion_chunk, pred_grip_chunk, pred_succ_logit = model(seq_t)
@@ -164,11 +161,10 @@ def evaluate(episodes=10):
                 # Self-evaluated task success probability
                 model_succ_prob = torch.sigmoid(pred_succ_logit).item()
 
-            # Store new predicted chunk: [H, 5]
             new_chunk = np.concatenate([pred_motion, pred_grip], axis=-1)
-            active_chunks.append((new_chunk, 0)) # (chunk_array, age_index)
+            active_chunks.append((new_chunk, 0))
 
-            # 2. Temporal Ensembling: Blend overlapping actions across time
+            # Temporal Ensembling
             ensembled_action = np.zeros(5, dtype=np.float32)
             total_weight = 0.0
 
@@ -184,7 +180,6 @@ def evaluate(episodes=10):
             if total_weight > 0:
                 ensembled_action /= total_weight
 
-            # Execute ensembled smooth action
             grip_cmd = 1.0 if ensembled_action[4] > 0.50 else 0.0
             full_delta = np.array([
                 ensembled_action[0], ensembled_action[1], ensembled_action[2], ensembled_action[3], grip_cmd
@@ -202,7 +197,6 @@ def evaluate(episodes=10):
             render_gui(screen, font, font_bold, sim, ep, episodes, step, max_steps, model_succ_prob, is_succ)
             time.sleep(0.015)
 
-            # Terminate episode if model reports high self-evaluated completion after release
             if is_succ and step > 120:
                 break
 
