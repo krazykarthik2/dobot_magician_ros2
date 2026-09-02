@@ -42,7 +42,7 @@ def generate_smooth_trajectory(start_pos, target_pos, num_steps):
     traj = np.outer(1 - s, start_pos) + np.outer(s, target_pos)
     return traj
 
-def render_gui(screen, font, font_bold, sim, current_demo_num, total_in_batch, total_saved, stage_name, trajectory_len, fps_mode):
+def render_gui(screen, font, font_bold, sim, current_demo_num, total_in_batch, total_saved, stage_name, trajectory_len, fps_mode, cam_img):
     screen.fill((25, 27, 34))
 
     # Top-Down Panel
@@ -63,7 +63,7 @@ def render_gui(screen, font, font_bold, sim, current_demo_num, total_in_batch, t
     pygame.draw.circle(screen, grip_color, (ex, ey), 8)
     pygame.draw.line(screen, (160, 170, 190), (200, 350), (ex, ey), 3)
 
-    top_label = font.render("TOP-DOWN VIEW (X-Y)", True, (170, 180, 200))
+    top_label = font.render("TOP-DOWN SIMULATION VIEW", True, (170, 180, 200))
     screen.blit(top_label, (30, 30))
 
     # Side Elevation Panel
@@ -82,44 +82,53 @@ def render_gui(screen, font, font_bold, sim, current_demo_num, total_in_batch, t
     esx, esy = world_to_side_screen(sim.ee_pos[0], sim.ee_pos[2])
     pygame.draw.circle(screen, grip_color, (esx, esy), 8)
 
-    side_label = font.render("SIDE ELEVATION VIEW (X-Z)", True, (170, 180, 200))
+    side_label = font.render("SIDE ELEVATION VIEW", True, (170, 180, 200))
     screen.blit(side_label, (410, 30))
 
+    # Inset Camera Feed (SmolVLA Visual Input)
+    if cam_img is not None:
+        # cam_img: [3, 64, 64] float in [0, 1]
+        img_hwc = (np.transpose(cam_img, (2, 1, 0)) * 255).astype(np.uint8)
+        cam_surf = pygame.surfarray.make_surface(img_hwc)
+        cam_surf_scaled = pygame.transform.scale(cam_surf, (100, 100))
+        screen.blit(cam_surf_scaled, (270, 270))
+        pygame.draw.rect(screen, (100, 220, 255), (270, 270, 100, 100), 2)
+        cam_tag = font.render("RGB VLM Cam (64x64)", True, (100, 220, 255))
+        screen.blit(cam_tag, (240, 250))
+
     # Bottom Status HUD
-    pygame.draw.rect(screen, (30, 33, 42), (20, 395, 740, 105), border_radius=8)
+    pygame.draw.rect(screen, (30, 33, 42), (20, 395, 740, 115), border_radius=8)
     
-    status_str = f"Generating Demo #{current_demo_num} (Batch: {total_in_batch} | Total Dataset: {total_saved})"
+    status_str = f"Generating VLA Demo #{current_demo_num} (Batch: {total_in_batch} | Total Dataset: {total_saved})"
     screen.blit(font_bold.render(status_str, True, (100, 210, 255)), (35, 405))
 
-    stage_str = f"Phase: {stage_name}"
-    screen.blit(font_bold.render(stage_str, True, (255, 220, 90)), (35, 440))
+    prompt_str = f"Prompt: \"{sim.instruction}\""
+    screen.blit(font_bold.render(prompt_str, True, (255, 230, 120)), (35, 432))
 
-    frames_str = f"Frames: {trajectory_len} timesteps"
-    screen.blit(font.render(frames_str, True, (200, 200, 210)), (580, 440))
+    stage_str = f"Phase: {stage_name} | Frames: {trajectory_len}"
+    screen.blit(font.render(stage_str, True, (200, 205, 220)), (35, 458))
 
-    speed_info = font.render(f"Speed: {fps_mode} | [F] Toggle Fast/Turbo | [Q] Stop", True, (150, 155, 170))
-    screen.blit(speed_info, (35, 468))
+    speed_info = font.render(f"Speed: {fps_mode} | [F] Toggle Fast | [Q] Stop", True, (140, 145, 160))
+    screen.blit(speed_info, (35, 482))
 
     pygame.display.flip()
 
 def run_auto_demonstrator(num_demos=60, base_delay=0.005):
-    print("=" * 65)
-    print("   Dobot Magician Automated Demonstration Generator")
-    print("   (Randomized Red Cube & Green Platform Scenes)")
-    print("=" * 65)
+    print("=" * 68)
+    print("   Dobot SmolVLA / Pi0 Multimodal Dataset Generator")
+    print("   (RGB Vision 64x64 + Language Prompt + 5D Proprioception)")
+    print("=" * 68)
     print(f">> Existing Demos in Dataset: {count_saved_demos()}")
-    print(f">> Generating Batch of {num_demos} smooth time-series demonstrations...")
-    print(">> Action format: [dx, dy, dz, dyaw, gripper_target, success_flag]")
-    print("=" * 65)
+    print(f">> Generating Batch of {num_demos} demonstrations...")
+    print("=" * 68)
 
     sim = DobotPickPlaceSim()
 
     pygame.init()
     screen = pygame.display.set_mode((780, 520))
-    pygame.display.set_caption("Dobot Random-Scene Expert Demonstration Generator")
-    font = pygame.font.SysFont("Arial", 15)
-    font_bold = pygame.font.SysFont("Arial", 18, bold=True)
-    clock = pygame.time.Clock()
+    pygame.display.set_caption("SmolVLA Multimodal Demonstration Generator")
+    font = pygame.font.SysFont("Arial", 14)
+    font_bold = pygame.font.SysFont("Arial", 16, bold=True)
 
     delay = base_delay
     fps_label = "Real-time High-Speed (120 FPS)"
@@ -127,11 +136,15 @@ def run_auto_demonstrator(num_demos=60, base_delay=0.005):
 
     while demos_completed < num_demos:
         demo_idx = get_next_demo_index()
-        obs = sim.reset(random_scene=True)
+        obs_dict = sim.reset(random_scene=True)
         cube_start = sim.cube_pos.copy()
         platform_target = sim.platform_pos.copy()
+        prompt_text = sim.instruction
 
-        trajectory = []
+        img_list = []
+        proprio_list = []
+        legacy_obs_list = []
+        action_list = []
         aborted = False
 
         hover_cube_z = 0.12
@@ -139,14 +152,14 @@ def run_auto_demonstrator(num_demos=60, base_delay=0.005):
         p_hover_cube = np.array([cube_start[0], cube_start[1], hover_cube_z], dtype=np.float32)
         
         stages = [
-            ("1. Move Over Red Cube (Top View)", p_start, p_hover_cube, 0.0, 0.0, 24),
-            ("2. Descend Toward Cube (Side View)", p_hover_cube, np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), 0.0, 0.0, 18),
-            ("3. Close Gripper & Grasp Cube", np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), 1.0, 0.0, 4),
-            ("4. Lift Cube Upward (Side View)", np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), p_hover_cube, 1.0, 0.0, 18),
-            ("5. Carry Cube Over Green Box (Top View)", p_hover_cube, np.array([platform_target[0], platform_target[1], hover_cube_z], dtype=np.float32), 1.0, 0.0, 26),
-            ("6. Lower Onto Platform (Side View)", np.array([platform_target[0], platform_target[1], hover_cube_z], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), 1.0, 0.0, 18),
-            ("7. Open Gripper & Release Cube", np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), 0.0, 1.0, 6),
-            ("8. Retract Arm (Task Complete)", np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.12], dtype=np.float32), 0.0, 1.0, 14),
+            ("1. Move Over Red Cube", p_start, p_hover_cube, 0.0, 0.0, 24),
+            ("2. Descend Toward Cube", p_hover_cube, np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), 0.0, 0.0, 18),
+            ("3. Close Gripper & Grasp", np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), 1.0, 0.0, 4),
+            ("4. Lift Cube Upward", np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), p_hover_cube, 1.0, 0.0, 18),
+            ("5. Carry Over Green Box", p_hover_cube, np.array([platform_target[0], platform_target[1], hover_cube_z], dtype=np.float32), 1.0, 0.0, 26),
+            ("6. Lower Onto Platform", np.array([platform_target[0], platform_target[1], hover_cube_z], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), 1.0, 0.0, 18),
+            ("7. Open Gripper & Release", np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), 0.0, 1.0, 6),
+            ("8. Retract Arm (Complete)", np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.12], dtype=np.float32), 0.0, 1.0, 14),
         ]
 
         for stage_name, start_pt, end_pt, grip_state, succ_state, steps in stages:
@@ -170,7 +183,11 @@ def run_auto_demonstrator(num_demos=60, base_delay=0.005):
                 if aborted:
                     break
 
-                obs_before = sim.get_observation()
+                # Capture Multimodal Observation Before Action
+                vla_obs = sim.get_vla_observation()
+                img_list.append(vla_obs["image"])        # [3, 64, 64] float32
+                proprio_list.append(vla_obs["proprio"])  # [5] float32
+                legacy_obs_list.append(sim.get_observation())
                 
                 current_ee = sim.ee_pos.copy()
                 dx = pt[0] - current_ee[0]
@@ -180,12 +197,11 @@ def run_auto_demonstrator(num_demos=60, base_delay=0.005):
                 
                 # 6-dim Action: [dx, dy, dz, dyaw, gripper_cmd, success_signal]
                 delta_action = np.array([dx, dy, dz, dyaw, grip_state, succ_state], dtype=np.float32)
+                action_list.append(delta_action)
                 sim.step_delta(delta_action[:5])
 
-                trajectory.append((obs_before, delta_action))
-
                 total_saved_now = count_saved_demos()
-                render_gui(screen, font, font_bold, sim, demo_idx, num_demos, total_saved_now, stage_name, len(trajectory), fps_label)
+                render_gui(screen, font, font_bold, sim, demo_idx, num_demos, total_saved_now, stage_name, len(action_list), fps_label, vla_obs["image"])
                 if delay > 0:
                     time.sleep(delay)
 
@@ -197,12 +213,19 @@ def run_auto_demonstrator(num_demos=60, base_delay=0.005):
             break
 
         filename = os.path.join(DATA_DIR, f"demo_{demo_idx:03d}.npz")
-        obs_arr = np.array([step[0] for step in trajectory], dtype=np.float32)
-        act_arr = np.array([step[1] for step in trajectory], dtype=np.float32)
-        np.savez_compressed(filename, observations=obs_arr, actions=act_arr)
+        
+        # Save complete multimodal VLA trajectory
+        np.savez_compressed(
+            filename,
+            images=np.array(img_list, dtype=np.float32),         # [N, 3, 64, 64]
+            proprioception=np.array(proprio_list, dtype=np.float32), # [N, 5]
+            observations=np.array(legacy_obs_list, dtype=np.float32), # [N, 11]
+            actions=np.array(action_list, dtype=np.float32),     # [N, 6]
+            prompt=np.array([prompt_text])                      # string array
+        )
         demos_completed += 1
         total_now = count_saved_demos()
-        print(f"[SUCCESS] Saved Demo #{demo_idx:03d} (Progress: {demos_completed}/{num_demos} | Total Dataset: {total_now}) -> {os.path.basename(filename)}")
+        print(f"[SUCCESS] Saved VLA Demo #{demo_idx:03d} (Progress: {demos_completed}/{num_demos} | Total: {total_now}) -> {os.path.basename(filename)}")
 
     pygame.quit()
     print(f"\n[DONE] Finished batch! Total {count_saved_demos()} demonstration datasets in: {DATA_DIR}")

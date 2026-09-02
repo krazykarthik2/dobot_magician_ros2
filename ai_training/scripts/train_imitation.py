@@ -15,13 +15,36 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 WINDOW_SIZE = 8   # Sequence window (T_obs = 8 past states)
 CHUNK_SIZE = 8    # Future trajectory chunk horizon (H_action = 8)
 
-class SmolVLADataset(Dataset):
+# -----------------------------------------------------------------------------
+# 1. Simple Robust Character/Word Language Tokenizer
+# -----------------------------------------------------------------------------
+VOCAB = [
+    "<pad>", "<unk>", "pick", "up", "the", "red", "cube", "block", "object",
+    "and", "place", "it", "on", "green", "platform", "box", "target",
+    "grasp", "move", "to", "transfer", "onto"
+]
+WORD_TO_IDX = {w: i for i, w in enumerate(VOCAB)}
+MAX_PROMPT_LEN = 12
+
+def tokenize_prompt(prompt_text, max_len=MAX_PROMPT_LEN):
+    tokens = prompt_text.lower().replace(".", "").replace(",", "").split()
+    indices = [WORD_TO_IDX.get(t, WORD_TO_IDX["<unk>"]) for t in tokens][:max_len]
+    while len(indices) < max_len:
+        indices.append(WORD_TO_IDX["<pad>"])
+    return np.array(indices, dtype=np.int64)
+
+# -----------------------------------------------------------------------------
+# 2. Multimodal VLA Dataset (Vision + Language + Proprioception)
+# -----------------------------------------------------------------------------
+class SmolVLAMultimodalDataset(Dataset):
     """
-    Dataset for SmolVLA / Pi0 Generalist Policy:
-    Input:
-      - Multi-Modal Scene Observation Sequence [T_obs=8, obs_dim=11]
-    Target:
-      - Future Action Trajectory Chunk [H_action=8, 6]:
+    Multimodal Dataset for SmolVLA / Pi0:
+    Inputs:
+      - RGB Camera Frame Image: [3, 64, 64]
+      - Past Proprioception Window: [T_obs=8, 5] (EE pos + gripper)
+      - Tokenized Language Instruction: [max_len=12]
+    Targets:
+      - Future Action Trajectory Chunk: [H_action=8, 6]
         [dx, dy, dz, dyaw, gripper_cmd, success_signal]
     """
     def __init__(self, data_dir, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE):
@@ -31,31 +54,48 @@ class SmolVLADataset(Dataset):
         if not files:
             raise ValueError(f"No demonstration files found in {data_dir}. Generate demos first!")
 
-        episodes_obs = []
+        episodes_img = []
+        episodes_proprio = []
         episodes_act = []
+        episodes_prompt = []
 
-        all_obs_flat = []
+        all_proprio_flat = []
         all_motion_flat = []
 
         for f in files:
-            data = np.load(f)
-            obs = data['observations']  # [N, 11]
-            act = data['actions']       # [N, 6] (or [N, 5])
+            data = np.load(f, allow_pickle=True)
+            
+            # Check if multimodal keys exist
+            if 'images' in data and 'proprioception' in data:
+                imgs = data['images']               # [N, 3, 64, 64]
+                proprio = data['proprioception']    # [N, 5]
+            else:
+                # Fallback synthesized image from 11-dim observation
+                obs = data['observations']
+                N = len(obs)
+                imgs = np.zeros((N, 3, 64, 64), dtype=np.float32)
+                proprio = obs[:, :5]
+
+            act = data['actions']                   # [N, 6] (or [N, 5])
             if act.shape[1] == 5:
                 succ_col = np.zeros((len(act), 1), dtype=np.float32)
                 act = np.concatenate([act, succ_col], axis=-1)
 
-            episodes_obs.append(obs)
-            episodes_act.append(act)
+            prompt_str = str(data['prompt'][0]) if 'prompt' in data else "pick up the red cube and place it on the green platform"
 
-            all_obs_flat.append(obs)
+            episodes_img.append(imgs)
+            episodes_proprio.append(proprio)
+            episodes_act.append(act)
+            episodes_prompt.append(tokenize_prompt(prompt_str))
+
+            all_proprio_flat.append(proprio)
             all_motion_flat.append(act[:, :4])
 
-        all_obs_concat = np.concatenate(all_obs_flat, axis=0)
+        all_proprio_concat = np.concatenate(all_proprio_flat, axis=0)
         all_motion_concat = np.concatenate(all_motion_flat, axis=0)
 
-        self.obs_mean = np.mean(all_obs_concat, axis=0)
-        self.obs_std = np.std(all_obs_concat, axis=0) + 1e-6
+        self.proprio_mean = np.mean(all_proprio_concat, axis=0)
+        self.proprio_std = np.std(all_proprio_concat, axis=0) + 1e-6
 
         self.motion_mean = np.mean(all_motion_concat, axis=0)
         self.motion_std = np.std(all_motion_concat, axis=0) + 1e-6
@@ -63,34 +103,37 @@ class SmolVLADataset(Dataset):
         stats_path = os.path.join(MODEL_DIR, "norm_stats.npz")
         np.savez(
             stats_path,
-            obs_mean=self.obs_mean,
-            obs_std=self.obs_std,
+            proprio_mean=self.proprio_mean,
+            proprio_std=self.proprio_std,
             motion_mean=self.motion_mean,
             motion_std=self.motion_std,
             window_size=self.window_size,
             chunk_size=self.chunk_size
         )
-        print(f"Saved SmolVLA / Pi0 normalization statistics -> {stats_path}")
+        print(f"Saved SmolVLA normalization statistics -> {stats_path}")
 
         self.samples = []
-        for obs_ep, act_ep in zip(episodes_obs, episodes_act):
-            norm_obs_ep = (obs_ep - self.obs_mean) / self.obs_std
+        for imgs_ep, proprio_ep, act_ep, prompt_tok in zip(episodes_img, episodes_proprio, episodes_act, episodes_prompt):
+            norm_proprio_ep = (proprio_ep - self.proprio_mean) / self.proprio_std
             
             motion_ep = act_ep[:, :4]
             discrete_ep = act_ep[:, 4:6]
             norm_motion_ep = (motion_ep - self.motion_mean) / self.motion_std
             norm_act_ep = np.concatenate([norm_motion_ep, discrete_ep], axis=-1)
 
-            ep_len = len(obs_ep)
+            ep_len = len(proprio_ep)
             for t in range(ep_len):
-                # 1. Past observation window [window_size, 11]
-                start_idx = max(0, t - window_size + 1)
-                window_obs = norm_obs_ep[start_idx : t + 1]
-                if len(window_obs) < window_size:
-                    pad = np.repeat(norm_obs_ep[0:1], window_size - len(window_obs), axis=0)
-                    window_obs = np.concatenate([pad, window_obs], axis=0)
+                # 1. Current RGB camera frame [3, 64, 64]
+                img_t = imgs_ep[t]
 
-                # 2. Future action chunk [chunk_size, 6]
+                # 2. Past proprioception sequence [T_obs=8, 5]
+                start_idx = max(0, t - window_size + 1)
+                window_proprio = norm_proprio_ep[start_idx : t + 1]
+                if len(window_proprio) < window_size:
+                    pad = np.repeat(norm_proprio_ep[0:1], window_size - len(window_proprio), axis=0)
+                    window_proprio = np.concatenate([pad, window_proprio], axis=0)
+
+                # 3. Future action trajectory chunk [H=8, 6]
                 end_idx = min(ep_len, t + chunk_size)
                 chunk_act = norm_act_ep[t:end_idx]
                 if len(chunk_act) < chunk_size:
@@ -98,67 +141,50 @@ class SmolVLADataset(Dataset):
                     chunk_act = np.concatenate([chunk_act, pad_act], axis=0)
 
                 self.samples.append((
-                    window_obs.astype(np.float32),
+                    img_t.astype(np.float32),
+                    window_proprio.astype(np.float32),
+                    prompt_tok.astype(np.int64),
                     chunk_act.astype(np.float32)
                 ))
 
-        print(f"Loaded {len(files)} episodes -> {len(self.samples)} SmolVLA sequence samples (Horizon={chunk_size}).")
+        print(f"Loaded {len(files)} episodes -> {len(self.samples)} Multimodal SmolVLA samples (Horizon={chunk_size}).")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        obs_seq, chunk_act = self.samples[idx]
-        return torch.tensor(obs_seq), torch.tensor(chunk_act)
+        img, proprio_seq, prompt, chunk_act = self.samples[idx]
+        return torch.tensor(img), torch.tensor(proprio_seq), torch.tensor(prompt), torch.tensor(chunk_act)
 
 
 # -----------------------------------------------------------------------------
-# SmolVLM-2 / Pi0 Architecture Modules: Multi-Layer Perception Backbone & Action Expert
+# 3. SmolVLM-2 Perception Backbone with Multi-Layer Extraction & Action Expert
 # -----------------------------------------------------------------------------
 
-class MultiLayerPerceptionBackbone(nn.Module):
+class VisionPatchEncoder(nn.Module):
     """
-    Lightweight SmolVLM-2 style Multi-Layer Transformer Perception Backbone:
-    Processes the raw sensorimotor scene tokens (EE, Cube, Platform) across T_obs timesteps.
-    Extracts multi-layer intermediate hidden representations across all its layers.
+    Lightweight Vision Patch Tokenizer for SmolVLM-2:
+    Takes [B, 3, 64, 64] RGB Image -> Conv/Patch Projection -> [B, N_patches=16, d_model=128]
     """
-    def __init__(self, in_dim=11, d_model=128, nhead=4, num_layers=3, dim_feedforward=256):
+    def __init__(self, in_channels=3, d_model=128, patch_size=16):
         super().__init__()
-        self.in_proj = nn.Sequential(
-            nn.Linear(in_dim, d_model),
-            nn.LayerNorm(d_model),
-            nn.GELU()
-        )
-        
-        # Transformer Layers
-        self.layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=0.05,
-                activation="gelu",
-                batch_first=True
-            )
-            for _ in range(num_layers)
-        ])
+        self.conv = nn.Conv2d(in_channels, d_model, kernel_size=patch_size, stride=patch_size)
+        self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, x):
-        # x: [B, T_obs, 11]
-        h = self.in_proj(x)
-        layer_outputs = []
-        for layer in self.layers:
-            h = layer(h)
-            layer_outputs.append(h) # Collect representations from each layer
-        return layer_outputs
+    def forward(self, img):
+        # img: [B, 3, 64, 64]
+        x = self.conv(img) # [B, d_model, 4, 4]
+        B, D, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2) # [B, 16, d_model]
+        return self.norm(x)
 
 
 class ActionExpertCrossAttentionBlock(nn.Module):
     """
-    Action Expert Transformer Block with:
-    - Multi-Head Causal Self-Attention (for intra-action trajectory consistency)
-    - Multi-Head Cross-Attention (conditions on multi-layer VLM perception features)
-    - Feed-Forward MLP with GELU
+    Action Expert Transformer Block (SmolVLA / Pi0):
+    - Causal Self-Attention over future action tokens (ensures trajectory smoothness)
+    - Cross-Attention over VLM layer tokens (conditions actions on vision + language)
+    - Feed-Forward MLP
     """
     def __init__(self, d_model=128, nhead=4, dim_feedforward=256):
         super().__init__()
@@ -176,11 +202,11 @@ class ActionExpertCrossAttentionBlock(nn.Module):
         )
 
     def forward(self, act_tokens, vlm_layer_feat):
-        # 1. Self-Attention over action chunk tokens
+        # 1. Self-attention over action chunk tokens
         sa_out, _ = self.self_attn(act_tokens, act_tokens, act_tokens)
         act_tokens = self.norm1(act_tokens + sa_out)
 
-        # 2. Cross-Attention over VLM layer features (Physical Intelligence Pi0 / SmolVLA mechanism)
+        # 2. Cross-attention over specific VLM layer features (SmolVLA Multi-Layer Fusion)
         ca_out, _ = self.cross_attn(query=act_tokens, key=vlm_layer_feat, value=vlm_layer_feat)
         act_tokens = self.norm2(act_tokens + ca_out)
 
@@ -192,88 +218,104 @@ class ActionExpertCrossAttentionBlock(nn.Module):
 
 class SmolVLAPolicy(nn.Module):
     """
-    SmolVLA / Pi0 Generalist Policy Architecture:
-    1. VLM Perception Backbone (SmolVLM-2 style): Generates multi-layer scene representations.
-    2. Multi-Layer Feature Aggregator: Fuses all intermediate VLM layers.
-    3. Action Expert: Interleaved cross-attention blocks decoding the future trajectory chunk H=8.
-    4. Multi-Head Output:
-       - Continuous Velocity Motion Chunk [B, H, 4] (dx, dy, dz, dyaw)
-       - Discrete Gripper Logits Chunk [B, H, 1]
-       - Self-Evaluated Success Logit [B, 1]
+    Complete SmolVLA / Pi0 Vision-Language-Action Policy:
+    1. Vision Encoder: Raw RGB Camera Image [3, 64, 64] -> Visual Tokens [B, 16, D]
+    2. Language Embedder: Instruction Prompt -> Text Tokens [B, 12, D]
+    3. Proprioception Projector: Robot State History [T_obs=8, 5] -> State Tokens [B, 8, D]
+    4. SmolVLM-2 Perception Backbone: Multi-Modal Transformer extracting representations across all layers.
+    5. Action Expert: Cross-Attention Decoder over all intermediate VLM layers.
+    6. Multi-Head Action & Success Output:
+       - Continuous Motion Chunk [B, H=8, 4] (dx, dy, dz, dyaw)
+       - Discrete Gripper Chunk [B, H=8, 1]
+       - Self-Evaluated Task Success [B, 1]
     """
-    def __init__(self, obs_dim=11, chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3):
+    def __init__(self, vocab_size=len(VOCAB), chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3):
         super().__init__()
         self.chunk_size = chunk_size
         self.d_model = d_model
 
-        # 1. Perception VLM Backbone
-        self.vlm_backbone = MultiLayerPerceptionBackbone(
-            in_dim=obs_dim,
-            d_model=d_model,
-            nhead=nhead,
-            num_layers=num_layers,
-            dim_feedforward=256
-        )
+        # 1. Modality Encoders
+        self.vision_encoder = VisionPatchEncoder(in_channels=3, d_model=d_model, patch_size=16)
+        self.lang_embedding = nn.Embedding(vocab_size, d_model)
+        self.proprio_proj = nn.Linear(5, d_model)
 
-        # 2. Multi-layer fusion: Projects concatenated multi-layer outputs back to d_model
-        self.layer_fusion = nn.Sequential(
-            nn.Linear(d_model * num_layers, d_model),
-            nn.LayerNorm(d_model),
-            nn.GELU()
-        )
+        # 2. Multi-Modal Perception Transformer (SmolVLM-2 style)
+        self.vlm_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=256,
+                dropout=0.05,
+                activation="gelu",
+                batch_first=True
+            )
+            for _ in range(num_layers)
+        ])
 
-        # 3. Action Expert: Learned query tokens for H=8 future timesteps
+        # 3. Action Expert Transformer (SmolVLA Action Expert)
         self.action_queries = nn.Parameter(torch.randn(1, chunk_size, d_model) * 0.02)
-        
         self.action_expert_layers = nn.ModuleList([
             ActionExpertCrossAttentionBlock(d_model=d_model, nhead=nhead, dim_feedforward=256)
             for _ in range(num_layers)
         ])
 
-        # 4. Output Heads
+        # 4. Multi-Layer Feature Fusion
+        self.fusion_proj = nn.Linear(d_model * num_layers, d_model)
+
+        # 5. Output Heads
         self.motion_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
-            nn.Linear(d_model // 2, 4)  # dx, dy, dz, dyaw
+            nn.Linear(d_model // 2, 4) # dx, dy, dz, dyaw
         )
 
         self.gripper_head = nn.Sequential(
             nn.Linear(d_model, d_model // 4),
             nn.GELU(),
-            nn.Linear(d_model // 4, 1)  # Gripper logit
+            nn.Linear(d_model // 4, 1) # Gripper logit
         )
 
         self.success_head = nn.Sequential(
             nn.Linear(d_model, d_model // 4),
             nn.GELU(),
-            nn.Linear(d_model // 4, 1)  # Task success confidence logit
+            nn.Linear(d_model // 4, 1) # Self-evaluated task completion
         )
 
-    def forward(self, obs_seq):
-        # obs_seq: [B, T_obs, 11]
-        batch_size = obs_seq.size(0)
+    def forward(self, img, proprio_seq, prompt_tokens):
+        # img: [B, 3, 64, 64]
+        # proprio_seq: [B, T_obs=8, 5]
+        # prompt_tokens: [B, max_len=12]
+        batch_size = img.size(0)
 
-        # Step 1: Extract all layer outputs from VLM perception backbone
-        vlm_all_layers = self.vlm_backbone(obs_seq) # List of [B, T_obs, d_model]
+        # Modality Token Projections
+        vis_tokens = self.vision_encoder(img)              # [B, 16, D]
+        lang_tokens = self.lang_embedding(prompt_tokens)   # [B, 12, D]
+        proprio_tokens = self.proprio_proj(proprio_seq)    # [B, 8, D]
 
-        # Step 2: Multi-layer fusion across all VLM layers
-        fused_vlm_feats = torch.cat(vlm_all_layers, dim=-1) # [B, T_obs, d_model * num_layers]
-        vlm_context = self.layer_fusion(fused_vlm_feats)     # [B, T_obs, d_model]
+        # Multi-Modal Prefix Sequence: [Language + Vision + Proprioception]
+        multimodal_seq = torch.cat([lang_tokens, vis_tokens, proprio_tokens], dim=1) # [B, 36, D]
 
-        # Step 3: Expand learned action queries across batch
-        act_tokens = self.action_queries.expand(batch_size, -1, -1) # [B, H, d_model]
+        # Step 1: Extract all layer outputs from SmolVLM-2 Perception Backbone
+        vlm_all_layers = []
+        h = multimodal_seq
+        for layer in self.vlm_layers:
+            h = layer(h)
+            vlm_all_layers.append(h)
 
-        # Step 4: Pass through Action Expert with Cross-Attention over each VLM layer
+        # Step 2: Action Expert queries cross-attend to each VLM layer
+        act_tokens = self.action_queries.expand(batch_size, -1, -1) # [B, H, D]
         for i, expert_block in enumerate(self.action_expert_layers):
-            layer_vlm_feat = vlm_all_layers[i] # Layer-specific conditioning (Pi0 / SmolVLA)
-            act_tokens = expert_block(act_tokens, layer_vlm_feat)
+            layer_feat = vlm_all_layers[i]
+            act_tokens = expert_block(act_tokens, layer_feat)
 
-        # Step 5: Multi-Head Action & Success Predictions
+        # Step 3: Multi-Head Action Predictions
         motion_chunk = self.motion_head(act_tokens)       # [B, H, 4]
         grip_chunk_logits = self.gripper_head(act_tokens) # [B, H, 1]
 
-        # Success evaluated from final VLM context state
-        success_logit = self.success_head(vlm_context[:, -1, :]) # [B, 1]
+        # Success evaluated from fused VLM multimodal context
+        fused_vlm = torch.cat(vlm_all_layers, dim=-1) # [B, 36, D * num_layers]
+        global_context = self.fusion_proj(fused_vlm).mean(dim=1) # [B, D]
+        success_logit = self.success_head(global_context) # [B, 1]
 
         return motion_chunk, grip_chunk_logits, success_logit
 
@@ -284,14 +326,14 @@ DobotActionChunkTransformer = SmolVLAPolicy
 
 def train(epochs=180, batch_size=128, lr=5e-4):
     print("=" * 68)
-    print("   SmolVLA / Pi0 Generalist Policy Training (Multi-Layer VLM Fusion)")
+    print("   SmolVLA / Pi0 Multimodal Generalist Policy Training")
+    print("   (Vision 64x64 + Language Instruction + 5D Proprioception)")
     print("=" * 68)
 
-    dataset = SmolVLADataset(DATA_DIR, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE)
+    dataset = SmolVLAMultimodalDataset(DATA_DIR, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    obs_dim = dataset.samples[0][0].shape[-1]
-    model = SmolVLAPolicy(obs_dim=obs_dim, chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3)
+    model = SmolVLAPolicy(vocab_size=len(VOCAB), chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3)
 
     model_path = os.path.join(MODEL_DIR, "dobot_bc_policy.pth")
     if os.path.exists(model_path):
@@ -325,9 +367,9 @@ def train(epochs=180, batch_size=128, lr=5e-4):
         total_grip = 0.0
         total_succ = 0.0
 
-        for seq_batch, target_chunk in dataloader:
+        for img_batch, proprio_batch, prompt_batch, target_chunk in dataloader:
             optimizer.zero_grad()
-            pred_motion_chunk, pred_grip_chunk, pred_succ = model(seq_batch)
+            pred_motion_chunk, pred_grip_chunk, pred_succ = model(img_batch, proprio_batch, prompt_batch)
 
             target_motion = target_chunk[:, :, :4]
             target_grip = target_chunk[:, :, 4:5]
@@ -347,10 +389,10 @@ def train(epochs=180, batch_size=128, lr=5e-4):
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item() * len(seq_batch)
-            total_motion += weighted_motion_loss.item() * len(seq_batch)
-            total_grip += grip_loss.item() * len(seq_batch)
-            total_succ += succ_loss.item() * len(seq_batch)
+            total_loss += loss.item() * len(img_batch)
+            total_motion += weighted_motion_loss.item() * len(img_batch)
+            total_grip += grip_loss.item() * len(img_batch)
+            total_succ += succ_loss.item() * len(img_batch)
 
         scheduler.step()
         avg_loss = total_loss / len(dataset)
@@ -362,7 +404,7 @@ def train(epochs=180, batch_size=128, lr=5e-4):
             print(f"Epoch [{epoch:03d}/{epochs}] - Total: {avg_loss:.5f} | Motion: {avg_motion:.5f} | Grip: {avg_grip:.5f} | Succ: {avg_succ:.5f} | LR: {scheduler.get_last_lr()[0]:.6f}")
 
     torch.save(model.state_dict(), model_path)
-    print(f"\n[SUCCESS] SmolVLA / Pi0 Generalist Policy saved -> {model_path}")
+    print(f"\n[SUCCESS] Multimodal SmolVLA Policy saved -> {model_path}")
 
 if __name__ == "__main__":
     train()
