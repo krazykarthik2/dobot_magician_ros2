@@ -4,3 +4,7 @@ install/
 log/
 __pycache__/
 *.pyc
+*.pyo
+ai_training/data/demos/*.npz
+ai_training/models/*.pth
+ai_training/models/*.npz
