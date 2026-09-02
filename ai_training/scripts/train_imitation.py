@@ -1,5 +1,6 @@
 import os
 import glob
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -10,162 +11,239 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "demos")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-class DemonstrationDataset(Dataset):
-    def __init__(self, data_dir):
-        files = glob.glob(os.path.join(data_dir, "demo_*.npz"))
+WINDOW_SIZE = 8   # Past observation history sequence (T_obs = 8)
+CHUNK_SIZE = 8    # Future action prediction horizon (H_action = 8)
+
+class ActionChunkingDataset(Dataset):
+    """
+    Action Chunking Dataset:
+    Inputs: Sequence of past observations [T_obs=8, obs_dim=11]
+    Targets: Future Action Trajectory Chunk [H_action=8, act_dim=5]
+             where act = [dx, dy, dz, dyaw, gripper_cmd]
+    """
+    def __init__(self, data_dir, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE):
+        self.window_size = window_size
+        self.chunk_size = chunk_size
+        files = sorted(glob.glob(os.path.join(data_dir, "demo_*.npz")))
         if not files:
             raise ValueError(f"No demonstration files found in {data_dir}. Generate demos first!")
-        
-        all_obs = []
-        all_acts = []
-        for f in sorted(files):
-            data = np.load(f)
-            all_obs.append(data['observations'])
-            all_acts.append(data['actions'])
-            
-        self.observations = np.concatenate(all_obs, axis=0)
-        self.actions = np.concatenate(all_acts, axis=0)
-        
-        # Compute mean & std normalization statistics
-        self.obs_mean = np.mean(self.observations, axis=0)
-        self.obs_std = np.std(self.observations, axis=0) + 1e-6
-        
-        self.act_mean = np.mean(self.actions, axis=0)
-        self.act_std = np.std(self.actions, axis=0) + 1e-6
-        
-        # Save normalization statistics
-        stats_path = os.path.join(MODEL_DIR, "norm_stats.npz")
-        np.savez(stats_path, obs_mean=self.obs_mean, obs_std=self.obs_std, act_mean=self.act_mean, act_std=self.act_std)
-        print(f"Saved normalization statistics -> {stats_path}")
 
-        # Normalized data
-        self.norm_obs = (self.observations - self.obs_mean) / self.obs_std
-        self.norm_acts = (self.actions - self.act_mean) / self.act_std
-        
-        print(f"Loaded {len(files)} demonstrations: total {len(self.observations)} transition frames.")
+        episodes_obs = []
+        episodes_act = []
+
+        all_obs_flat = []
+        all_motion_flat = []
+
+        for f in files:
+            data = np.load(f)
+            obs = data['observations']  # [N, 11]
+            act = data['actions']       # [N, 5]
+
+            episodes_obs.append(obs)
+            episodes_act.append(act)
+
+            all_obs_flat.append(obs)
+            all_motion_flat.append(act[:, :4])
+
+        all_obs_concat = np.concatenate(all_obs_flat, axis=0)
+        all_motion_concat = np.concatenate(all_motion_flat, axis=0)
+
+        self.obs_mean = np.mean(all_obs_concat, axis=0)
+        self.obs_std = np.std(all_obs_concat, axis=0) + 1e-6
+
+        self.motion_mean = np.mean(all_motion_concat, axis=0)
+        self.motion_std = np.std(all_motion_concat, axis=0) + 1e-6
+
+        stats_path = os.path.join(MODEL_DIR, "norm_stats.npz")
+        np.savez(
+            stats_path,
+            obs_mean=self.obs_mean,
+            obs_std=self.obs_std,
+            motion_mean=self.motion_mean,
+            motion_std=self.motion_std,
+            window_size=self.window_size,
+            chunk_size=self.chunk_size
+        )
+        print(f"Saved Action Chunking normalization statistics -> {stats_path}")
+
+        self.samples = []
+        for obs_ep, act_ep in zip(episodes_obs, episodes_act):
+            norm_obs_ep = (obs_ep - self.obs_mean) / self.obs_std
+            
+            motion_ep = act_ep[:, :4]
+            grip_ep = act_ep[:, 4:5]
+            norm_motion_ep = (motion_ep - self.motion_mean) / self.motion_std
+            norm_act_ep = np.concatenate([norm_motion_ep, grip_ep], axis=-1)
+
+            ep_len = len(obs_ep)
+            for t in range(ep_len):
+                # 1. Past observation window [window_size, 11]
+                start_idx = max(0, t - window_size + 1)
+                window_obs = norm_obs_ep[start_idx : t + 1]
+                if len(window_obs) < window_size:
+                    pad = np.repeat(norm_obs_ep[0:1], window_size - len(window_obs), axis=0)
+                    window_obs = np.concatenate([pad, window_obs], axis=0)
+
+                # 2. Future action chunk [chunk_size, 5]
+                end_idx = min(ep_len, t + chunk_size)
+                chunk_act = norm_act_ep[t:end_idx]
+                if len(chunk_act) < chunk_size:
+                    pad_act = np.repeat(norm_act_ep[-1:], chunk_size - len(chunk_act), axis=0)
+                    chunk_act = np.concatenate([chunk_act, pad_act], axis=0)
+
+                self.samples.append((
+                    window_obs.astype(np.float32),
+                    chunk_act.astype(np.float32)
+                ))
+
+        print(f"Loaded {len(files)} episodes -> {len(self.samples)} Action-Chunk samples (Horizon={chunk_size}).")
 
     def __len__(self):
-        return len(self.observations)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        return (
-            torch.tensor(self.norm_obs[idx], dtype=torch.float32),
-            torch.tensor(self.norm_acts[idx], dtype=torch.float32)
-        )
+        obs_seq, chunk_act = self.samples[idx]
+        return torch.tensor(obs_seq), torch.tensor(chunk_act)
 
-class DobotResidualPolicy(nn.Module):
-    """Deep Residual MLP Policy with LayerNorm and GELU activations."""
-    def __init__(self, obs_dim=18, act_dim=5, hidden_dim=256):
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=64):
         super().__init__()
-        self.in_proj = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU()
-        )
-        
-        # Residual Block 1
-        self.res1_fc1 = nn.Linear(hidden_dim, hidden_dim)
-        self.res1_ln1 = nn.LayerNorm(hidden_dim)
-        self.res1_gelu = nn.GELU()
-        self.res1_fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.res1_ln2 = nn.LayerNorm(hidden_dim)
-        
-        # Residual Block 2
-        self.res2_fc1 = nn.Linear(hidden_dim, hidden_dim)
-        self.res2_ln1 = nn.LayerNorm(hidden_dim)
-        self.res2_gelu = nn.GELU()
-        self.res2_fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.res2_ln2 = nn.LayerNorm(hidden_dim)
-
-        self.out_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, act_dim)
-        )
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
 
     def forward(self, x):
-        h = self.in_proj(x)
-        # ResBlock 1
-        r1 = self.res1_gelu(self.res1_ln1(self.res1_fc1(h)))
-        h = h + self.res1_ln2(self.res1_fc2(r1))
-        # ResBlock 2
-        r2 = self.res2_gelu(self.res2_ln1(self.res2_fc1(h)))
-        h = h + self.res2_ln2(self.res2_fc2(r2))
-        
-        return self.out_head(h)
+        return x + self.pe[:, :x.size(1)]
 
-def train(epochs=150, batch_size=128, lr=3e-4):
+class DobotActionChunkTransformer(nn.Module):
+    """
+    Action Chunking Transformer (ACT) for Dobot Pick & Place:
+    - Input: Sequence of past observations [B, T_obs=8, obs_dim=11]
+    - Backbone: Multi-Head Self-Attention Transformer
+    - Output: Multi-Step Future Trajectory Chunk [B, H=8, 5]
+              (4 continuous velocity channels + 1 gripper logit per timestep)
+    """
+    def __init__(self, obs_dim=11, chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3, dim_feedforward=256):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.d_model = d_model
+
+        self.input_proj = nn.Sequential(
+            nn.Linear(obs_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU()
+        )
+        self.pos_enc = PositionalEncoding(d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=0.05,
+            activation="gelu",
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Action Chunking Decoder Head: Projects latent representation to H future steps
+        self.chunk_head = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Linear(dim_feedforward, chunk_size * 5)  # H * (4 motion + 1 gripper)
+        )
+
+    def forward(self, x_seq):
+        # x_seq: [B, T_obs, obs_dim]
+        tokens = self.input_proj(x_seq)
+        tokens = self.pos_enc(tokens)
+
+        trans_out = self.transformer(tokens)  # [B, T_obs, d_model]
+        current_rep = trans_out[:, -1, :]     # [B, d_model]
+
+        flat_chunk = self.chunk_head(current_rep) # [B, H * 5]
+        chunk_out = flat_chunk.view(-1, self.chunk_size, 5) # [B, H, 5]
+
+        motion_chunk = chunk_out[:, :, :4]    # [B, H, 4: dx, dy, dz, dyaw]
+        grip_chunk_logits = chunk_out[:, :, 4:5] # [B, H, 1: gripper logit]
+        return motion_chunk, grip_chunk_logits
+
+def train(epochs=180, batch_size=128, lr=5e-4):
     print("=" * 65)
-    print("   Dobot Magician Deep Residual Imitation Learning")
+    print("   Dobot Action Chunking Transformer (ACT) Policy Training")
     print("=" * 65)
-    
-    dataset = DemonstrationDataset(DATA_DIR)
+
+    dataset = ActionChunkingDataset(DATA_DIR, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    obs_dim = dataset.observations.shape[1]
-    act_dim = dataset.actions.shape[1]
-    
-    model = DobotResidualPolicy(obs_dim=obs_dim, act_dim=act_dim, hidden_dim=256)
-    
-    # Check if existing checkpoint exists and load weights safely
+    obs_dim = dataset.samples[0][0].shape[-1]
+    model = DobotActionChunkTransformer(obs_dim=obs_dim, chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3)
+
     model_path = os.path.join(MODEL_DIR, "dobot_bc_policy.pth")
-    resumed_training = False
-    
     if os.path.exists(model_path):
         try:
-            checkpoint = torch.load(model_path, map_location="cpu")
+            ckpt = torch.load(model_path, map_location="cpu")
             model_dict = model.state_dict()
-            
-            # Verify layer shapes & parameter counts
-            compatible_dict = {}
-            for k, v in checkpoint.items():
-                if k in model_dict and model_dict[k].shape == v.shape:
-                    compatible_dict[k] = v
-                else:
-                    print(f" [!] Skipping incompatible parameter layer: {k}")
-
-            if len(compatible_dict) == len(model_dict):
-                model.load_state_dict(compatible_dict)
-                print(f">> [CHECKPOINT RESUME] Successfully loaded 100% weights from: {os.path.basename(model_path)}")
-                resumed_training = True
-            elif len(compatible_dict) > 0:
-                model_dict.update(compatible_dict)
+            compat = {k: v for k, v in ckpt.items() if k in model_dict and model_dict[k].shape == v.shape}
+            if len(compat) == len(model_dict):
+                model.load_state_dict(compat)
+                print(f">> [RESUME] Loaded 100% ACT weights from: {os.path.basename(model_path)}")
+            elif len(compat) > 0:
+                model_dict.update(compat)
                 model.load_state_dict(model_dict)
-                print(f">> [WARM START] Loaded {len(compatible_dict)}/{len(model_dict)} layers from existing checkpoint.")
-                resumed_training = True
-            else:
-                print(">> [INFO] Existing checkpoint architecture mismatch. Training from fresh initialization.")
+                print(f">> [WARM START] Loaded {len(compat)}/{len(model_dict)} layers.")
         except Exception as e:
-            print(f">> [WARNING] Could not load existing checkpoint ({e}). Starting fresh.")
-    else:
-        print(">> [INFO] No existing checkpoint found. Training fresh model.")
+            print(f">> [INFO] Initializing fresh ACT Transformer.")
 
-    optimizer = optim.AdamW(model.parameters(), lr=lr if resumed_training else 5e-4, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
-    criterion = nn.SmoothL1Loss()
 
-    mode_str = "Fine-tuning from checkpoint" if resumed_training else "Training from scratch"
-    print(f"\n>> {mode_str} on CPU across {len(dataset)} transitions ({epochs} epochs)...")
-    
+    huber_loss_fn = nn.SmoothL1Loss(reduction='none')
+    bce_loss_fn = nn.BCEWithLogitsLoss()
+    axis_weights = torch.tensor([1.0, 1.0, 4.0, 1.0], dtype=torch.float32)
+
+    print(f"\n>> Training ACT Model on CPU across {len(dataset)} Action-Chunks ({epochs} epochs)...")
+
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
-        for obs_batch, act_batch in dataloader:
+        total_motion = 0.0
+        total_grip = 0.0
+
+        for seq_batch, target_chunk in dataloader:
             optimizer.zero_grad()
-            pred_act = model(obs_batch)
-            loss = criterion(pred_act, act_batch)
+            pred_motion_chunk, pred_grip_chunk = model(seq_batch)
+
+            target_motion = target_chunk[:, :, :4]
+            target_grip = target_chunk[:, :, 4:5]
+
+            # Weighted motion Huber loss across all chunk timesteps
+            raw_motion_loss = huber_loss_fn(pred_motion_chunk, target_motion) # [B, H, 4]
+            weighted_motion_loss = (raw_motion_loss * axis_weights).mean()
+
+            # Binary Cross Entropy for gripper across chunk
+            grip_loss = bce_loss_fn(pred_grip_chunk, target_grip)
+
+            loss = weighted_motion_loss + 3.0 * grip_loss
             loss.backward()
             optimizer.step()
-            total_loss += loss.item() * len(obs_batch)
+
+            total_loss += loss.item() * len(seq_batch)
+            total_motion += weighted_motion_loss.item() * len(seq_batch)
+            total_grip += grip_loss.item() * len(seq_batch)
 
         scheduler.step()
         avg_loss = total_loss / len(dataset)
-        if epoch % 20 == 0 or epoch == 1 or epoch == epochs:
-            print(f"Epoch [{epoch:03d}/{epochs}] - Huber Loss: {avg_loss:.7f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+        avg_motion = total_motion / len(dataset)
+        avg_grip = total_grip / len(dataset)
 
-    # Save updated checkpoint
+        if epoch % 20 == 0 or epoch == 1 or epoch == epochs:
+            print(f"Epoch [{epoch:03d}/{epochs}] - Total: {avg_loss:.5f} | Motion Chunk: {avg_motion:.5f} | Grip BCE: {avg_grip:.5f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+
     torch.save(model.state_dict(), model_path)
-    print(f"\n[SUCCESS] Updated checkpoint saved -> {model_path}")
+    print(f"\n[SUCCESS] Action Chunking Policy saved -> {model_path}")
 
 if __name__ == "__main__":
     train()

@@ -10,7 +10,6 @@ class DobotKinematics:
         self.L4 = 0.060    # Tool end-effector offset
 
     def forward(self, j1, j2, j3, j4):
-        """Compute end-effector (X, Y, Z, Yaw) from joint angles (radians)."""
         r = self.L2 * np.cos(j2) + self.L3 * np.cos(j2 + j3) + self.L4
         x = r * np.cos(j1)
         y = r * np.sin(j1)
@@ -19,7 +18,6 @@ class DobotKinematics:
         return np.array([x, y, z, yaw], dtype=np.float32)
 
     def inverse(self, x, y, z, yaw=0.0):
-        """Compute joint angles [j1, j2, j3, j4] from target (X, Y, Z, Yaw)."""
         j1 = np.arctan2(y, x)
         r_total = np.sqrt(x**2 + y**2)
         r = r_total - self.L4
@@ -40,7 +38,14 @@ class DobotKinematics:
         return np.array([j1, j2, j3, j4], dtype=np.float32)
 
 class DobotPickPlaceSim:
-    """Fast, deterministic physics simulation for Dobot Pick & Place with normalized state spaces."""
+    """
+    Clean 11-Dimensional Observation Environment:
+    - Robot EE Pose: [x, y, z, yaw] (4)
+    - Robot Gripper Status: [grip_val] (1)
+    - Cube Position: [x, y, z] (3)
+    - Target Platform Position: [x, y, z] (3)
+    Total = 11 raw dimensions (No hand-crafted distance or latch cheats)
+    """
     def __init__(self):
         self.kin = DobotKinematics()
         self.cube_size = 0.022
@@ -72,62 +77,52 @@ class DobotPickPlaceSim:
         return self.get_observation()
 
     def get_observation(self):
-        """
-        Rich 16-dimensional observation vector with relative vectors:
-        - EE Pos (X, Y, Z, Yaw) [4]
-        - Gripper open/closed [1]
-        - Cube Pos (X, Y, Z) [3]
-        - Goal Platform Pos (X, Y, Z) [3]
-        - Vector from EE to Cube (dx, dy, dz) [3]
-        - Vector from Cube to Goal Platform (dx, dy, dz) [3]
-        - Grasped status flag [1]
-        Total: 18 dimensions
-        """
-        ee_xyz = self.ee_pos[:3]
-        vec_to_cube = self.cube_pos - ee_xyz
-        vec_cube_to_goal = self.platform_pos - self.cube_pos
         grip_val = 1.0 if self.gripper_closed else 0.0
-        grasp_val = 1.0 if self.grasped else 0.0
-
         return np.array([
-            self.ee_pos[0], self.ee_pos[1], self.ee_pos[2], self.ee_pos[3], # 0..3: EE Pose
-            grip_val,                                                       # 4: Gripper status
-            self.cube_pos[0], self.cube_pos[1], self.cube_pos[2],           # 5..7: Cube pos
-            self.platform_pos[0], self.platform_pos[1], self.platform_pos[2],# 8..10: Goal pos
-            vec_to_cube[0], vec_to_cube[1], vec_to_cube[2],                 # 11..13: EE -> Cube
-            vec_cube_to_goal[0], vec_cube_to_goal[1], vec_cube_to_goal[2], # 14..16: Cube -> Goal
-            grasp_val                                                       # 17: Grasp flag
+            self.ee_pos[0], self.ee_pos[1], self.ee_pos[2], self.ee_pos[3], # 0..3: Robot EE Pose
+            grip_val,                                                       # 4: Gripper Status
+            self.cube_pos[0], self.cube_pos[1], self.cube_pos[2],           # 5..7: Cube Position
+            self.platform_pos[0], self.platform_pos[1], self.platform_pos[2]# 8..10: Goal Platform
         ], dtype=np.float32)
 
+    def step_delta(self, delta_action, max_step=0.006):
+        """Applies bounded velocity delta displacement."""
+        dx = np.clip(delta_action[0], -max_step, max_step)
+        dy = np.clip(delta_action[1], -max_step, max_step)
+        dz = np.clip(delta_action[2], -max_step, max_step)
+        dyaw = np.clip(delta_action[3], -0.1, 0.1)
+
+        new_x = np.clip(self.ee_pos[0] + dx, 0.12, 0.32)
+        new_y = np.clip(self.ee_pos[1] + dy, -0.25, 0.25)
+        new_z = np.clip(self.ee_pos[2] + dz, 0.015, 0.22)
+        new_yaw = self.ee_pos[3] + dyaw
+
+        target_ee = [new_x, new_y, new_z, new_yaw, delta_action[4]]
+        return self.step(target_ee)
+
     def step(self, target_ee):
-        """
-        target_ee: [X, Y, Z, Yaw, Gripper (0: open, 1: closed)]
-        """
         self.ee_pos = np.array(target_ee[:4], dtype=np.float32)
         self.gripper_closed = bool(target_ee[4] > 0.5)
 
         ee_xyz = self.ee_pos[:3]
         dist_to_cube = np.linalg.norm(ee_xyz - self.cube_pos)
 
-        # Grasping logic
+        # Grasping physics
         if self.gripper_closed:
-            if dist_to_cube < 0.03:
+            if dist_to_cube < 0.032:
                 self.grasped = True
         else:
             self.grasped = False
 
-        # If grasped, cube follows end-effector
         if self.grasped:
             self.cube_pos = ee_xyz.copy()
             self.cube_pos[2] = max(self.cube_pos[2] - 0.015, 0.011)
         else:
-            # Gravity
             if self.cube_pos[2] > 0.011:
                 self.cube_pos[2] = max(self.cube_pos[2] - 0.01, 0.011)
 
         obs = self.get_observation()
         
-        # Check success
         dist_to_goal = np.linalg.norm(self.cube_pos[:2] - self.platform_pos[:2])
         is_success = bool(dist_to_goal < 0.04 and self.cube_pos[2] <= 0.025 and not self.gripper_closed)
 

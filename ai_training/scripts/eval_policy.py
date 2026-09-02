@@ -7,7 +7,7 @@ import pygame
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "env"))
 from dobot_env import DobotPickPlaceSim
-from train_imitation import DobotResidualPolicy, MODEL_DIR
+from train_imitation import DobotActionChunkTransformer, MODEL_DIR, WINDOW_SIZE, CHUNK_SIZE
 
 def world_to_screen(x, y):
     sx = int(200 + (y / 0.30) * 160)
@@ -65,7 +65,7 @@ def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, is_
     # Bottom Status HUD
     pygame.draw.rect(screen, (30, 33, 42), (20, 395, 740, 105), border_radius=8)
     
-    title_str = f"AI Autopilot Evaluation: Episode {ep} / {total_eps}"
+    title_str = f"Action-Chunking AI (ACT): Episode {ep} / {total_eps}"
     screen.blit(font_bold.render(title_str, True, (100, 210, 255)), (35, 405))
 
     steps_str = f"Step: {step} / {max_steps}"
@@ -75,8 +75,8 @@ def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, is_
         succ_label = font_bold.render("[SUCCESS: CUBE PLACED ON PLATFORM!]", True, (80, 255, 120))
         screen.blit(succ_label, (35, 440))
     else:
-        status_mode = "Grasping / Transporting Cube..." if sim.grasped else "Navigating toward Cube..."
-        screen.blit(font.render(f"Policy Action: {status_mode}", True, (255, 220, 100)), (35, 440))
+        status_mode = "Transporting Cube -> Goal..." if sim.grasped else "Navigating toward Cube..."
+        screen.blit(font.render(f"Policy: {status_mode}", True, (255, 220, 100)), (35, 440))
 
     info_str = font.render(f"EE: [{sim.ee_pos[0]:.3f}, {sim.ee_pos[1]:.3f}, {sim.ee_pos[2]:.3f}] | Cube: [{sim.cube_pos[0]:.3f}, {sim.cube_pos[1]:.3f}] | [ESC] Exit", True, (140, 145, 160))
     screen.blit(info_str, (35, 468))
@@ -88,22 +88,18 @@ def evaluate(episodes=10):
     stats_path = os.path.join(MODEL_DIR, "norm_stats.npz")
     
     if not os.path.exists(model_path) or not os.path.exists(stats_path):
-        print("\n" + "=" * 60)
-        print(" [ERROR] Trained model or normalization stats not found!")
-        print(f" Expected at: {model_path} and {stats_path}")
-        print(" Please run Step [1] (Generate Demos) and Step [3] (Train Model) first.")
-        print("=" * 60 + "\n")
+        print("\n [ERROR] Model or stats not found! Train model first.")
         return
 
-    # Load stats
     stats = np.load(stats_path)
     obs_mean = stats['obs_mean']
     obs_std = stats['obs_std']
-    act_mean = stats['act_mean']
-    act_std = stats['act_std']
+    motion_mean = stats['motion_mean']
+    motion_std = stats['motion_std']
+    window_size = int(stats['window_size']) if 'window_size' in stats else WINDOW_SIZE
+    chunk_size = int(stats['chunk_size']) if 'chunk_size' in stats else CHUNK_SIZE
 
-    # Load policy
-    model = DobotResidualPolicy(obs_dim=len(obs_mean), act_dim=len(act_mean), hidden_dim=256)
+    model = DobotActionChunkTransformer(obs_dim=len(obs_mean), chunk_size=chunk_size, d_model=128, nhead=4, num_layers=3)
     model.load_state_dict(torch.load(model_path, map_location="cpu"))
     model.eval()
 
@@ -111,26 +107,30 @@ def evaluate(episodes=10):
 
     pygame.init()
     screen = pygame.display.set_mode((780, 520))
-    pygame.display.set_caption("Dobot AI Autopilot Evaluation (Top & Side View)")
+    pygame.display.set_caption("Dobot Action-Chunking AI Evaluation")
     font = pygame.font.SysFont("Arial", 15)
     font_bold = pygame.font.SysFont("Arial", 18, bold=True)
     clock = pygame.time.Clock()
 
     successes = 0
-    max_steps = 145
+    max_steps = 180
 
     print("=" * 60)
-    print("      Testing Trained AI Policy on Random Cube Positions")
+    print("   Testing Action Chunking Policy (Receding Horizon H=8)")
     print("=" * 60)
 
     for ep in range(1, episodes + 1):
         obs = sim.reset(random_cube=True)
         print(f"\nEpisode {ep}/{episodes} - Initial Cube Pos: [{obs[5]:.3f}, {obs[6]:.3f}]")
         
+        norm_obs_init = (obs - obs_mean) / obs_std
+        obs_history = [norm_obs_init.copy() for _ in range(window_size)]
+        
         ep_success = False
         aborted = False
 
-        for step in range(1, max_steps + 1):
+        step = 0
+        while step < max_steps:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     pygame.quit()
@@ -141,22 +141,41 @@ def evaluate(episodes=10):
             if aborted:
                 break
 
-            # Normalize observation before feeding to neural network
-            norm_obs = (obs - obs_mean) / obs_std
+            # Infer next chunk of H=8 actions from past observation history
+            seq_t = torch.tensor(np.array([obs_history]), dtype=torch.float32)
 
             with torch.no_grad():
-                obs_t = torch.tensor(norm_obs, dtype=torch.float32).unsqueeze(0)
-                norm_act = model(obs_t).squeeze(0).numpy()
+                pred_motion_chunk, pred_grip_chunk = model(seq_t)
+                
+                # Denormalize motion chunk: [H, 4]
+                pred_motion_chunk = (pred_motion_chunk.squeeze(0).numpy() * motion_std) + motion_mean
+                # Sigmoid probabilities for gripper: [H, 1]
+                grip_probs = torch.sigmoid(pred_grip_chunk).squeeze(0).numpy()
 
-            # Denormalize action to physical world coordinates
-            pred_act = norm_act * act_std + act_mean
+            # Execute chunk for k=4 steps (Receding Horizon Execution)
+            exec_steps = min(4, chunk_size)
+            for k in range(exec_steps):
+                step += 1
+                motion_k = pred_motion_chunk[k]
+                grip_k = 1.0 if grip_probs[k, 0] > 0.50 else 0.0
 
-            obs, is_succ = sim.step(pred_act)
-            if is_succ:
-                ep_success = True
+                full_delta = np.array([
+                    motion_k[0], motion_k[1], motion_k[2], motion_k[3], grip_k
+                ], dtype=np.float32)
 
-            render_gui(screen, font, font_bold, sim, ep, episodes, step, max_steps, ep_success)
-            time.sleep(0.015)
+                obs, is_succ = sim.step_delta(full_delta, max_step=0.007)
+                if is_succ:
+                    ep_success = True
+
+                norm_obs = (obs - obs_mean) / obs_std
+                obs_history.pop(0)
+                obs_history.append(norm_obs)
+
+                render_gui(screen, font, font_bold, sim, ep, episodes, step, max_steps, ep_success)
+                time.sleep(0.015)
+
+                if ep_success and step > 130:
+                    break
 
             if ep_success and step > 130:
                 break
@@ -168,9 +187,9 @@ def evaluate(episodes=10):
             successes += 1
             print(f"Episode {ep}: SUCCESS! Cube placed on platform.")
         else:
-            print(f"Episode {ep}: Missed platform.")
+            print(f"Episode {ep}: Failed.")
 
-        time.sleep(0.5)
+        time.sleep(0.3)
 
     print(f"\n==================================================")
     print(f" Final Score: {successes} / {episodes} Successes ({(successes/episodes)*100:.1f}%)")

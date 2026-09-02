@@ -13,7 +13,6 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "demos")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 def get_next_demo_index():
-    """Finds highest existing index and returns next index so demos always append/accumulate."""
     files = glob.glob(os.path.join(DATA_DIR, "demo_*.npz"))
     if not files:
         return 1
@@ -89,7 +88,7 @@ def render_gui(screen, font, font_bold, sim, current_demo_num, total_in_batch, t
     # Bottom Status HUD
     pygame.draw.rect(screen, (30, 33, 42), (20, 395, 740, 105), border_radius=8)
     
-    status_str = f"Appending Demo #{current_demo_num} (Batch: {total_in_batch} | Total in Dataset: {total_saved})"
+    status_str = f"Generating Demo #{current_demo_num} (Batch: {total_in_batch} | Total Dataset: {total_saved})"
     screen.blit(font_bold.render(status_str, True, (100, 210, 255)), (35, 405))
 
     stage_str = f"Phase: {stage_name}"
@@ -98,37 +97,34 @@ def render_gui(screen, font, font_bold, sim, current_demo_num, total_in_batch, t
     frames_str = f"Frames: {trajectory_len} timesteps"
     screen.blit(font.render(frames_str, True, (200, 200, 210)), (580, 440))
 
-    speed_info = font.render(f"Speed: {fps_mode} | [F] Toggle Fast/Turbo | [ESC] Stop", True, (150, 155, 170))
+    speed_info = font.render(f"Speed: {fps_mode} | [F] Toggle Fast/Turbo | [Q] Stop", True, (150, 155, 170))
     screen.blit(speed_info, (35, 468))
 
     pygame.display.flip()
 
-def run_auto_demonstrator(num_demos=50, base_delay=0.008):
-    start_idx = get_next_demo_index()
-    end_idx = start_idx + num_demos - 1
-
+def run_auto_demonstrator(num_demos=50, base_delay=0.005):
     print("=" * 65)
-    print("      Dobot Magician Automated Demonstration Generator")
+    print("   Dobot Magician Automated Delta-Action Demonstration Generator")
     print("=" * 65)
-    print(f">> Existing Demos: {count_saved_demos()}")
-    print(f">> Generating {num_demos} new demos: demo_{start_idx:03d}.npz -> demo_{end_idx:03d}.npz")
-    print(">> All files APPEND to existing datasets without overwriting.")
-    print(">> Controls: [F] Toggle Fast/Turbo Speed  |  [ESC] Stop & Save Collected")
+    print(f">> Existing Demos in Dataset: {count_saved_demos()}")
+    print(f">> Generating Batch of {num_demos} smooth time-series demonstrations...")
+    print(">> Action format: [dx, dy, dz, dyaw, gripper_target]")
     print("=" * 65)
 
     sim = DobotPickPlaceSim()
 
     pygame.init()
     screen = pygame.display.set_mode((780, 520))
-    pygame.display.set_caption("Dobot Automated Expert Demonstration Generator (Accumulative)")
+    pygame.display.set_caption("Dobot Delta-Action Expert Demonstration Generator")
     font = pygame.font.SysFont("Arial", 15)
     font_bold = pygame.font.SysFont("Arial", 18, bold=True)
     clock = pygame.time.Clock()
 
     delay = base_delay
     fps_label = "Real-time High-Speed (120 FPS)"
+    demos_completed = 0
 
-    for i in range(num_demos):
+    while demos_completed < num_demos:
         demo_idx = get_next_demo_index()
         obs = sim.reset(random_cube=True)
         cube_start = sim.cube_pos.copy()
@@ -142,14 +138,14 @@ def run_auto_demonstrator(num_demos=50, base_delay=0.008):
         p_hover_cube = np.array([cube_start[0], cube_start[1], hover_cube_z], dtype=np.float32)
         
         stages = [
-            ("1. Move Over Red Cube (Top View)", p_start, p_hover_cube, 0.0, 22),
+            ("1. Move Over Red Cube (Top View)", p_start, p_hover_cube, 0.0, 24),
             ("2. Descend Toward Cube (Side View)", p_hover_cube, np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), 0.0, 18),
             ("3. Close Gripper & Grasp Cube", np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), 1.0, 10),
             ("4. Lift Cube Upward (Side View)", np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), p_hover_cube, 1.0, 18),
-            ("5. Carry Cube Over Green Box (Top View)", p_hover_cube, np.array([platform_target[0], platform_target[1], hover_cube_z], dtype=np.float32), 1.0, 25),
+            ("5. Carry Cube Over Green Box (Top View)", p_hover_cube, np.array([platform_target[0], platform_target[1], hover_cube_z], dtype=np.float32), 1.0, 26),
             ("6. Lower Onto Platform (Side View)", np.array([platform_target[0], platform_target[1], hover_cube_z], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), 1.0, 18),
             ("7. Open Gripper & Release Cube", np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), 0.0, 10),
-            ("8. Retract Arm to Hover Position", np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.12], dtype=np.float32), 0.0, 15),
+            ("8. Retract Arm to Hover Position", np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.12], dtype=np.float32), 0.0, 16),
         ]
 
         for stage_name, start_pt, end_pt, grip_state, steps in stages:
@@ -160,11 +156,11 @@ def run_auto_demonstrator(num_demos=50, base_delay=0.008):
                         pygame.quit()
                         return
                     elif event.type == pygame.KEYDOWN:
-                        if event.key == pygame.K_ESCAPE:
+                        if event.key == pygame.K_q:
                             aborted = True
                         elif event.key == pygame.K_f:
                             if delay > 0.001:
-                                delay = 0.0005
+                                delay = 0.0001
                                 fps_label = "Turbo Speed (Max FPS)"
                             else:
                                 delay = base_delay
@@ -174,10 +170,17 @@ def run_auto_demonstrator(num_demos=50, base_delay=0.008):
                     break
 
                 obs_before = sim.get_observation()
-                action = np.array([pt[0], pt[1], pt[2], 0.0, grip_state], dtype=np.float32)
-                sim.step(action)
+                
+                current_ee = sim.ee_pos.copy()
+                dx = pt[0] - current_ee[0]
+                dy = pt[1] - current_ee[1]
+                dz = pt[2] - current_ee[2]
+                dyaw = 0.0
+                
+                delta_action = np.array([dx, dy, dz, dyaw, grip_state], dtype=np.float32)
+                sim.step_delta(delta_action)
 
-                trajectory.append((obs_before, action))
+                trajectory.append((obs_before, delta_action))
 
                 total_saved_now = count_saved_demos()
                 render_gui(screen, font, font_bold, sim, demo_idx, num_demos, total_saved_now, stage_name, len(trajectory), fps_label)
@@ -191,16 +194,16 @@ def run_auto_demonstrator(num_demos=50, base_delay=0.008):
             print("\n[INFO] Demonstration generation stopped by user.")
             break
 
-        # Save appending file
         filename = os.path.join(DATA_DIR, f"demo_{demo_idx:03d}.npz")
         obs_arr = np.array([step[0] for step in trajectory], dtype=np.float32)
         act_arr = np.array([step[1] for step in trajectory], dtype=np.float32)
         np.savez_compressed(filename, observations=obs_arr, actions=act_arr)
+        demos_completed += 1
         total_now = count_saved_demos()
-        print(f"[SUCCESS] Appended Demo #{demo_idx:03d} (Total Dataset: {total_now} demos) -> {os.path.basename(filename)}")
+        print(f"[SUCCESS] Saved Demo #{demo_idx:03d} (Progress: {demos_completed}/{num_demos} | Total Dataset: {total_now}) -> {os.path.basename(filename)}")
 
     pygame.quit()
-    print(f"\n[DONE] Finished batch! Total {count_saved_demos()} demonstration datasets saved in: {DATA_DIR}")
+    print(f"\n[DONE] Finished batch! Total {count_saved_demos()} demonstration datasets in: {DATA_DIR}")
 
 if __name__ == "__main__":
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 50
