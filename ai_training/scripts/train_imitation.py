@@ -18,8 +18,8 @@ class ActionChunkingDataset(Dataset):
     """
     Action Chunking Dataset:
     Inputs: Sequence of past observations [T_obs=8, obs_dim=11]
-    Targets: Future Action Trajectory Chunk [H_action=8, act_dim=5]
-             where act = [dx, dy, dz, dyaw, gripper_cmd]
+    Targets: Future Action Trajectory Chunk [H_action=8, act_dim=6]
+             where act = [dx, dy, dz, dyaw, gripper_cmd, success_signal]
     """
     def __init__(self, data_dir, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE):
         self.window_size = window_size
@@ -37,7 +37,11 @@ class ActionChunkingDataset(Dataset):
         for f in files:
             data = np.load(f)
             obs = data['observations']  # [N, 11]
-            act = data['actions']       # [N, 5]
+            act = data['actions']       # [N, 6] (or [N, 5])
+            if act.shape[1] == 5:
+                # Add default zero success column if old format
+                succ_col = np.zeros((len(act), 1), dtype=np.float32)
+                act = np.concatenate([act, succ_col], axis=-1)
 
             episodes_obs.append(obs)
             episodes_act.append(act)
@@ -71,9 +75,9 @@ class ActionChunkingDataset(Dataset):
             norm_obs_ep = (obs_ep - self.obs_mean) / self.obs_std
             
             motion_ep = act_ep[:, :4]
-            grip_ep = act_ep[:, 4:5]
+            discrete_ep = act_ep[:, 4:6] # [N, 2: gripper_cmd, success_signal]
             norm_motion_ep = (motion_ep - self.motion_mean) / self.motion_std
-            norm_act_ep = np.concatenate([norm_motion_ep, grip_ep], axis=-1)
+            norm_act_ep = np.concatenate([norm_motion_ep, discrete_ep], axis=-1)
 
             ep_len = len(obs_ep)
             for t in range(ep_len):
@@ -84,7 +88,7 @@ class ActionChunkingDataset(Dataset):
                     pad = np.repeat(norm_obs_ep[0:1], window_size - len(window_obs), axis=0)
                     window_obs = np.concatenate([pad, window_obs], axis=0)
 
-                # 2. Future action chunk [chunk_size, 5]
+                # 2. Future action chunk [chunk_size, 6]
                 end_idx = min(ep_len, t + chunk_size)
                 chunk_act = norm_act_ep[t:end_idx]
                 if len(chunk_act) < chunk_size:
@@ -120,11 +124,10 @@ class PositionalEncoding(nn.Module):
 
 class DobotActionChunkTransformer(nn.Module):
     """
-    Action Chunking Transformer (ACT) for Dobot Pick & Place:
-    - Input: Sequence of past observations [B, T_obs=8, obs_dim=11]
-    - Backbone: Multi-Head Self-Attention Transformer
-    - Output: Multi-Step Future Trajectory Chunk [B, H=8, 5]
-              (4 continuous velocity channels + 1 gripper logit per timestep)
+    Action Chunking Transformer with 3 Multi-Head Outputs:
+    - Continuous Velocity Motion Chunk [B, H, 4] -> dx, dy, dz, dyaw
+    - Binary Gripper Logits Chunk [B, H, 1] -> Grasp command
+    - Task Success Classification Logit [B, 1] -> Self-evaluated task completion
     """
     def __init__(self, obs_dim=11, chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3, dim_feedforward=256):
         super().__init__()
@@ -148,15 +151,21 @@ class DobotActionChunkTransformer(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # Action Chunking Decoder Head: Projects latent representation to H future steps
+        # 1. Action Chunking Trajectory Head
         self.chunk_head = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
             nn.GELU(),
             nn.Linear(dim_feedforward, chunk_size * 5)  # H * (4 motion + 1 gripper)
         )
 
+        # 2. Self-Evaluated Success Head (1 scalar logit for whole episode state)
+        self.success_head = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward // 2),
+            nn.GELU(),
+            nn.Linear(dim_feedforward // 2, 1)
+        )
+
     def forward(self, x_seq):
-        # x_seq: [B, T_obs, obs_dim]
         tokens = self.input_proj(x_seq)
         tokens = self.pos_enc(tokens)
 
@@ -168,11 +177,14 @@ class DobotActionChunkTransformer(nn.Module):
 
         motion_chunk = chunk_out[:, :, :4]    # [B, H, 4: dx, dy, dz, dyaw]
         grip_chunk_logits = chunk_out[:, :, 4:5] # [B, H, 1: gripper logit]
-        return motion_chunk, grip_chunk_logits
+        
+        success_logit = self.success_head(current_rep) # [B, 1: task completed logit]
+        return motion_chunk, grip_chunk_logits, success_logit
 
 def train(epochs=180, batch_size=128, lr=5e-4):
     print("=" * 65)
-    print("   Dobot Action Chunking Transformer (ACT) Policy Training")
+    print("   Dobot Action Chunking Transformer Policy Training")
+    print("   (With Self-Evaluated Success Head & Randomized Platform)")
     print("=" * 65)
 
     dataset = ActionChunkingDataset(DATA_DIR, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE)
@@ -211,13 +223,15 @@ def train(epochs=180, batch_size=128, lr=5e-4):
         total_loss = 0.0
         total_motion = 0.0
         total_grip = 0.0
+        total_succ = 0.0
 
         for seq_batch, target_chunk in dataloader:
             optimizer.zero_grad()
-            pred_motion_chunk, pred_grip_chunk = model(seq_batch)
+            pred_motion_chunk, pred_grip_chunk, pred_succ = model(seq_batch)
 
             target_motion = target_chunk[:, :, :4]
             target_grip = target_chunk[:, :, 4:5]
+            target_succ = target_chunk[:, -1, 5:6]  # Success flag at current frame
 
             # Weighted motion Huber loss across all chunk timesteps
             raw_motion_loss = huber_loss_fn(pred_motion_chunk, target_motion) # [B, H, 4]
@@ -225,22 +239,27 @@ def train(epochs=180, batch_size=128, lr=5e-4):
 
             # Binary Cross Entropy for gripper across chunk
             grip_loss = bce_loss_fn(pred_grip_chunk, target_grip)
+            
+            # Binary Cross Entropy for self-evaluated task success
+            succ_loss = bce_loss_fn(pred_succ, target_succ)
 
-            loss = weighted_motion_loss + 3.0 * grip_loss
+            loss = weighted_motion_loss + 3.0 * grip_loss + 2.0 * succ_loss
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item() * len(seq_batch)
             total_motion += weighted_motion_loss.item() * len(seq_batch)
             total_grip += grip_loss.item() * len(seq_batch)
+            total_succ += succ_loss.item() * len(seq_batch)
 
         scheduler.step()
         avg_loss = total_loss / len(dataset)
         avg_motion = total_motion / len(dataset)
         avg_grip = total_grip / len(dataset)
+        avg_succ = total_succ / len(dataset)
 
         if epoch % 20 == 0 or epoch == 1 or epoch == epochs:
-            print(f"Epoch [{epoch:03d}/{epochs}] - Total: {avg_loss:.5f} | Motion Chunk: {avg_motion:.5f} | Grip BCE: {avg_grip:.5f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+            print(f"Epoch [{epoch:03d}/{epochs}] - Total: {avg_loss:.5f} | Motion: {avg_motion:.5f} | Grip: {avg_grip:.5f} | Succ: {avg_succ:.5f} | LR: {scheduler.get_last_lr()[0]:.6f}")
 
     torch.save(model.state_dict(), model_path)
     print(f"\n[SUCCESS] Action Chunking Policy saved -> {model_path}")

@@ -39,40 +39,53 @@ class DobotKinematics:
 
 class DobotPickPlaceSim:
     """
-    Clean 11-Dimensional Observation Environment:
-    - Robot EE Pose: [x, y, z, yaw] (4)
-    - Robot Gripper Status: [grip_val] (1)
-    - Cube Position: [x, y, z] (3)
-    - Target Platform Position: [x, y, z] (3)
-    Total = 11 raw dimensions (No hand-crafted distance or latch cheats)
+    Simulation Environment:
+    - Robot Base Origin: (0, 0, 0)
+    - State:
+        * EE Pose: [x, y, z, yaw] (4)
+        * Gripper Status: [grip_val] (1)
+        * Red Cube Position: [x, y, z] (3) -> Randomly sampled each episode
+        * Green Platform Position: [x, y, z] (3) -> Randomly sampled each episode
+    Total State Observation = 11 dimensions.
     """
     def __init__(self):
         self.kin = DobotKinematics()
         self.cube_size = 0.022
-        self.platform_pos = np.array([0.22, -0.15, 0.005], dtype=np.float32)
         self.gripper_closed = False
         self.grasped = False
         
         # State
         self.ee_pos = np.array([0.20, 0.0, 0.12, 0.0], dtype=np.float32)
         self.cube_pos = np.array([0.22, 0.12, 0.011], dtype=np.float32)
+        self.platform_pos = np.array([0.22, -0.15, 0.005], dtype=np.float32)
         self.reset()
 
-    def reset(self, random_cube=True):
+    def reset(self, random_scene=True):
         self.ee_pos = np.array([0.20, 0.0, 0.12, 0.0], dtype=np.float32)
         self.gripper_closed = False
         self.grasped = False
 
-        if random_cube:
-            angle = np.random.uniform(-np.pi/4, np.pi/4)
-            dist = np.random.uniform(0.18, 0.28)
-            cx = dist * np.cos(angle)
-            cy = dist * np.sin(angle)
-            if cy < -0.06 and cx < 0.26:
-                cy += 0.12
+        if random_scene:
+            # 1. Random Red Cube Position
+            angle_c = np.random.uniform(-0.65, 0.65)
+            dist_c = np.random.uniform(0.18, 0.28)
+            cx = dist_c * np.cos(angle_c)
+            cy = dist_c * np.sin(angle_c)
             self.cube_pos = np.array([cx, cy, 0.011], dtype=np.float32)
+
+            # 2. Random Green Platform Position (ensuring separation from cube)
+            while True:
+                angle_p = np.random.uniform(-0.75, 0.75)
+                dist_p = np.random.uniform(0.18, 0.28)
+                px = dist_p * np.cos(angle_p)
+                py = dist_p * np.sin(angle_p)
+                # Keep platform and cube at least 10 cm apart
+                if np.hypot(px - cx, py - cy) > 0.10:
+                    self.platform_pos = np.array([px, py, 0.005], dtype=np.float32)
+                    break
         else:
             self.cube_pos = np.array([0.22, 0.12, 0.011], dtype=np.float32)
+            self.platform_pos = np.array([0.22, -0.15, 0.005], dtype=np.float32)
 
         return self.get_observation()
 

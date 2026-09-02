@@ -102,20 +102,21 @@ def render_gui(screen, font, font_bold, sim, current_demo_num, total_in_batch, t
 
     pygame.display.flip()
 
-def run_auto_demonstrator(num_demos=50, base_delay=0.005):
+def run_auto_demonstrator(num_demos=60, base_delay=0.005):
     print("=" * 65)
-    print("   Dobot Magician Automated Delta-Action Demonstration Generator")
+    print("   Dobot Magician Automated Demonstration Generator")
+    print("   (Randomized Red Cube & Green Platform Scenes)")
     print("=" * 65)
     print(f">> Existing Demos in Dataset: {count_saved_demos()}")
     print(f">> Generating Batch of {num_demos} smooth time-series demonstrations...")
-    print(">> Action format: [dx, dy, dz, dyaw, gripper_target]")
+    print(">> Action format: [dx, dy, dz, dyaw, gripper_target, success_flag]")
     print("=" * 65)
 
     sim = DobotPickPlaceSim()
 
     pygame.init()
     screen = pygame.display.set_mode((780, 520))
-    pygame.display.set_caption("Dobot Delta-Action Expert Demonstration Generator")
+    pygame.display.set_caption("Dobot Random-Scene Expert Demonstration Generator")
     font = pygame.font.SysFont("Arial", 15)
     font_bold = pygame.font.SysFont("Arial", 18, bold=True)
     clock = pygame.time.Clock()
@@ -126,7 +127,7 @@ def run_auto_demonstrator(num_demos=50, base_delay=0.005):
 
     while demos_completed < num_demos:
         demo_idx = get_next_demo_index()
-        obs = sim.reset(random_cube=True)
+        obs = sim.reset(random_scene=True)
         cube_start = sim.cube_pos.copy()
         platform_target = sim.platform_pos.copy()
 
@@ -138,17 +139,17 @@ def run_auto_demonstrator(num_demos=50, base_delay=0.005):
         p_hover_cube = np.array([cube_start[0], cube_start[1], hover_cube_z], dtype=np.float32)
         
         stages = [
-            ("1. Move Over Red Cube (Top View)", p_start, p_hover_cube, 0.0, 24),
-            ("2. Descend Toward Cube (Side View)", p_hover_cube, np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), 0.0, 18),
-            ("3. Close Gripper & Grasp Cube", np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), 1.0, 10),
-            ("4. Lift Cube Upward (Side View)", np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), p_hover_cube, 1.0, 18),
-            ("5. Carry Cube Over Green Box (Top View)", p_hover_cube, np.array([platform_target[0], platform_target[1], hover_cube_z], dtype=np.float32), 1.0, 26),
-            ("6. Lower Onto Platform (Side View)", np.array([platform_target[0], platform_target[1], hover_cube_z], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), 1.0, 18),
-            ("7. Open Gripper & Release Cube", np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), 0.0, 10),
-            ("8. Retract Arm to Hover Position", np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.12], dtype=np.float32), 0.0, 16),
+            ("1. Move Over Red Cube (Top View)", p_start, p_hover_cube, 0.0, 0.0, 24),
+            ("2. Descend Toward Cube (Side View)", p_hover_cube, np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), 0.0, 0.0, 18),
+            ("3. Close Gripper & Grasp Cube", np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), 1.0, 0.0, 4),
+            ("4. Lift Cube Upward (Side View)", np.array([cube_start[0], cube_start[1], 0.026], dtype=np.float32), p_hover_cube, 1.0, 0.0, 18),
+            ("5. Carry Cube Over Green Box (Top View)", p_hover_cube, np.array([platform_target[0], platform_target[1], hover_cube_z], dtype=np.float32), 1.0, 0.0, 26),
+            ("6. Lower Onto Platform (Side View)", np.array([platform_target[0], platform_target[1], hover_cube_z], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), 1.0, 0.0, 18),
+            ("7. Open Gripper & Release Cube", np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), 0.0, 1.0, 6),
+            ("8. Retract Arm (Task Complete)", np.array([platform_target[0], platform_target[1], 0.035], dtype=np.float32), np.array([platform_target[0], platform_target[1], 0.12], dtype=np.float32), 0.0, 1.0, 14),
         ]
 
-        for stage_name, start_pt, end_pt, grip_state, steps in stages:
+        for stage_name, start_pt, end_pt, grip_state, succ_state, steps in stages:
             pts = generate_smooth_trajectory(start_pt, end_pt, steps)
             for pt in pts:
                 for event in pygame.event.get():
@@ -177,8 +178,9 @@ def run_auto_demonstrator(num_demos=50, base_delay=0.005):
                 dz = pt[2] - current_ee[2]
                 dyaw = 0.0
                 
-                delta_action = np.array([dx, dy, dz, dyaw, grip_state], dtype=np.float32)
-                sim.step_delta(delta_action)
+                # 6-dim Action: [dx, dy, dz, dyaw, gripper_cmd, success_signal]
+                delta_action = np.array([dx, dy, dz, dyaw, grip_state, succ_state], dtype=np.float32)
+                sim.step_delta(delta_action[:5])
 
                 trajectory.append((obs_before, delta_action))
 
@@ -206,5 +208,5 @@ def run_auto_demonstrator(num_demos=50, base_delay=0.005):
     print(f"\n[DONE] Finished batch! Total {count_saved_demos()} demonstration datasets in: {DATA_DIR}")
 
 if __name__ == "__main__":
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 50
+    n = int(sys.argv[1]) if len(sys.argv) > 1 else 60
     run_auto_demonstrator(num_demos=n)

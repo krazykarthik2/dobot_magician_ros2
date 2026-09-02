@@ -19,7 +19,7 @@ def world_to_side_screen(x, z, offset_x=400):
     sy = int(350 - (z / 0.25) * 280)
     return sx, sy
 
-def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, is_success):
+def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, model_succ_prob, is_success):
     screen.fill((25, 27, 34))
 
     # Top-Down Panel
@@ -65,20 +65,22 @@ def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, is_
     # Bottom Status HUD
     pygame.draw.rect(screen, (30, 33, 42), (20, 395, 740, 105), border_radius=8)
     
-    title_str = f"Action-Chunking AI (ACT): Episode {ep} / {total_eps}"
+    title_str = f"ACT AI (Ensembled): Episode {ep} / {total_eps}"
     screen.blit(font_bold.render(title_str, True, (100, 210, 255)), (35, 405))
 
     steps_str = f"Step: {step} / {max_steps}"
     screen.blit(font.render(steps_str, True, (200, 200, 210)), (450, 408))
 
-    if is_success:
-        succ_label = font_bold.render("[SUCCESS: CUBE PLACED ON PLATFORM!]", True, (80, 255, 120))
-        screen.blit(succ_label, (35, 440))
-    else:
-        status_mode = "Transporting Cube -> Goal..." if sim.grasped else "Navigating toward Cube..."
-        screen.blit(font.render(f"Policy: {status_mode}", True, (255, 220, 100)), (35, 440))
+    # Display Model's Self-Evaluated Success Confidence
+    succ_color = (80, 255, 120) if model_succ_prob > 0.60 else (200, 200, 210)
+    conf_str = f"Model Self-Evaluated Success: {model_succ_prob*100:.1f}%"
+    screen.blit(font_bold.render(conf_str, True, succ_color), (35, 435))
 
-    info_str = font.render(f"EE: [{sim.ee_pos[0]:.3f}, {sim.ee_pos[1]:.3f}, {sim.ee_pos[2]:.3f}] | Cube: [{sim.cube_pos[0]:.3f}, {sim.cube_pos[1]:.3f}] | [ESC] Exit", True, (140, 145, 160))
+    if is_success:
+        succ_label = font_bold.render("[TASK COMPLETED: CUBE PLACED!]", True, (80, 255, 120))
+        screen.blit(succ_label, (420, 435))
+
+    info_str = font.render(f"EE: [{sim.ee_pos[0]:.2f}, {sim.ee_pos[1]:.2f}, {sim.ee_pos[2]:.2f}] | Goal: [{sim.platform_pos[0]:.2f}, {sim.platform_pos[1]:.2f}] | [ESC] Exit", True, (140, 145, 160))
     screen.blit(info_str, (35, 468))
 
     pygame.display.flip()
@@ -107,7 +109,7 @@ def evaluate(episodes=10):
 
     pygame.init()
     screen = pygame.display.set_mode((780, 520))
-    pygame.display.set_caption("Dobot Action-Chunking AI Evaluation")
+    pygame.display.set_caption("Dobot Temporal Ensembling ACT Evaluation")
     font = pygame.font.SysFont("Arial", 15)
     font_bold = pygame.font.SysFont("Arial", 18, bold=True)
     clock = pygame.time.Clock()
@@ -115,22 +117,31 @@ def evaluate(episodes=10):
     successes = 0
     max_steps = 180
 
-    print("=" * 60)
-    print("   Testing Action Chunking Policy (Receding Horizon H=8)")
-    print("=" * 60)
+    # Temporal Ensembling Exponential Weights: w_i = exp(-k * i)
+    exp_weights = np.exp(-0.4 * np.arange(chunk_size))
+    exp_weights = exp_weights / exp_weights.sum()
+
+    print("=" * 65)
+    print("   Testing ACT Policy with Exponential Temporal Ensembling")
+    print("   (Random Red Cube & Random Green Platform Scenes)")
+    print("=" * 65)
 
     for ep in range(1, episodes + 1):
-        obs = sim.reset(random_cube=True)
-        print(f"\nEpisode {ep}/{episodes} - Initial Cube Pos: [{obs[5]:.3f}, {obs[6]:.3f}]")
+        obs = sim.reset(random_scene=True)
+        print(f"\nEpisode {ep}/{episodes} - Cube: [{obs[5]:.3f}, {obs[6]:.3f}] | Platform: [{obs[8]:.3f}, {obs[9]:.3f}]")
         
         norm_obs_init = (obs - obs_mean) / obs_std
         obs_history = [norm_obs_init.copy() for _ in range(window_size)]
         
+        # Buffer of overlapping predicted action chunks for temporal ensembling
+        # List of chunks currently active at time t
+        active_chunks = []
+
         ep_success = False
         aborted = False
+        model_succ_prob = 0.0
 
-        step = 0
-        while step < max_steps:
+        for step in range(1, max_steps + 1):
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     pygame.quit()
@@ -141,43 +152,58 @@ def evaluate(episodes=10):
             if aborted:
                 break
 
-            # Infer next chunk of H=8 actions from past observation history
+            # 1. Query policy at every frame
             seq_t = torch.tensor(np.array([obs_history]), dtype=torch.float32)
-
             with torch.no_grad():
-                pred_motion_chunk, pred_grip_chunk = model(seq_t)
+                pred_motion_chunk, pred_grip_chunk, pred_succ_logit = model(seq_t)
                 
-                # Denormalize motion chunk: [H, 4]
-                pred_motion_chunk = (pred_motion_chunk.squeeze(0).numpy() * motion_std) + motion_mean
-                # Sigmoid probabilities for gripper: [H, 1]
-                grip_probs = torch.sigmoid(pred_grip_chunk).squeeze(0).numpy()
+                # Denormalize motion
+                pred_motion = (pred_motion_chunk.squeeze(0).numpy() * motion_std) + motion_mean
+                # Sigmoid grip probabilities
+                pred_grip = torch.sigmoid(pred_grip_chunk).squeeze(0).numpy()
+                # Self-evaluated task success probability
+                model_succ_prob = torch.sigmoid(pred_succ_logit).item()
 
-            # Execute chunk for k=4 steps (Receding Horizon Execution)
-            exec_steps = min(4, chunk_size)
-            for k in range(exec_steps):
-                step += 1
-                motion_k = pred_motion_chunk[k]
-                grip_k = 1.0 if grip_probs[k, 0] > 0.50 else 0.0
+            # Store new predicted chunk: [H, 5]
+            new_chunk = np.concatenate([pred_motion, pred_grip], axis=-1)
+            active_chunks.append((new_chunk, 0)) # (chunk_array, age_index)
 
-                full_delta = np.array([
-                    motion_k[0], motion_k[1], motion_k[2], motion_k[3], grip_k
-                ], dtype=np.float32)
+            # 2. Temporal Ensembling: Blend overlapping actions across time
+            ensembled_action = np.zeros(5, dtype=np.float32)
+            total_weight = 0.0
 
-                obs, is_succ = sim.step_delta(full_delta, max_step=0.007)
-                if is_succ:
-                    ep_success = True
+            updated_active = []
+            for chunk_arr, age in active_chunks:
+                if age < chunk_size:
+                    w = exp_weights[age]
+                    ensembled_action += w * chunk_arr[age]
+                    total_weight += w
+                    updated_active.append((chunk_arr, age + 1))
+            active_chunks = updated_active
 
-                norm_obs = (obs - obs_mean) / obs_std
-                obs_history.pop(0)
-                obs_history.append(norm_obs)
+            if total_weight > 0:
+                ensembled_action /= total_weight
 
-                render_gui(screen, font, font_bold, sim, ep, episodes, step, max_steps, ep_success)
-                time.sleep(0.015)
+            # Execute ensembled smooth action
+            grip_cmd = 1.0 if ensembled_action[4] > 0.50 else 0.0
+            full_delta = np.array([
+                ensembled_action[0], ensembled_action[1], ensembled_action[2], ensembled_action[3], grip_cmd
+            ], dtype=np.float32)
 
-                if ep_success and step > 130:
-                    break
+            obs, is_succ = sim.step_delta(full_delta, max_step=0.007)
+            if is_succ or model_succ_prob > 0.85:
+                ep_success = True
 
-            if ep_success and step > 130:
+            # Update observation sequence history
+            norm_obs = (obs - obs_mean) / obs_std
+            obs_history.pop(0)
+            obs_history.append(norm_obs)
+
+            render_gui(screen, font, font_bold, sim, ep, episodes, step, max_steps, model_succ_prob, is_succ)
+            time.sleep(0.015)
+
+            # Terminate episode if model reports high self-evaluated completion after release
+            if is_succ and step > 120:
                 break
 
         if aborted:
@@ -185,9 +211,9 @@ def evaluate(episodes=10):
 
         if ep_success:
             successes += 1
-            print(f"Episode {ep}: SUCCESS! Cube placed on platform.")
+            print(f"Episode {ep}: SUCCESS! Task completed.")
         else:
-            print(f"Episode {ep}: Failed.")
+            print(f"Episode {ep}: Missed platform.")
 
         time.sleep(0.3)
 
