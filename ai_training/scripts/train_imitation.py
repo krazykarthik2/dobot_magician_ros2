@@ -8,6 +8,11 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
+# Maximize CPU parallelism across all available cores
+NUM_THREADS = min(8, os.cpu_count() or 4)
+torch.set_num_threads(NUM_THREADS)
+torch.set_num_interop_threads(NUM_THREADS)
+
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "demos")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -35,18 +40,12 @@ def tokenize_prompt(prompt_text, max_len=MAX_PROMPT_LEN):
     return np.array(indices, dtype=np.int64)
 
 # -----------------------------------------------------------------------------
-# 2. Multimodal VLA Dataset (Vision with Distractors + Language + Proprioception)
+# 2. High-Speed Pre-Tensorized Multimodal Dataset
 # -----------------------------------------------------------------------------
 class SmolVLAMultimodalDataset(Dataset):
     """
-    Multimodal Dataset for SmolVLA / Pi0:
-    Inputs:
-      - RGB Camera Frame Image: [3, 64, 64] with visual distractors & clutter
-      - Past Proprioception Window: [T_obs=8, 5] (EE pos + gripper)
-      - Tokenized Language Instruction: [max_len=14] (specifying target color & goal)
-    Targets:
-      - Future Action Trajectory Chunk: [H_action=8, 6]
-        [dx, dy, dz, dyaw, gripper_cmd, success_signal]
+    High-Speed In-Memory Pre-Tensorized Dataset:
+    Zero runtime per-item tensor conversion overhead.
     """
     def __init__(self, data_dir, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE):
         self.window_size = window_size
@@ -111,7 +110,11 @@ class SmolVLAMultimodalDataset(Dataset):
         )
         print(f"Saved SmolVLA normalization statistics -> {stats_path}")
 
-        self.samples = []
+        img_list = []
+        proprio_list = []
+        prompt_list = []
+        act_list = []
+
         for imgs_ep, proprio_ep, act_ep, prompt_tok in zip(episodes_img, episodes_proprio, episodes_act, episodes_prompt):
             norm_proprio_ep = (proprio_ep - self.proprio_mean) / self.proprio_std
             
@@ -136,21 +139,24 @@ class SmolVLAMultimodalDataset(Dataset):
                     pad_act = np.repeat(norm_act_ep[-1:], chunk_size - len(chunk_act), axis=0)
                     chunk_act = np.concatenate([chunk_act, pad_act], axis=0)
 
-                self.samples.append((
-                    img_t.astype(np.float32),
-                    window_proprio.astype(np.float32),
-                    prompt_tok.astype(np.int64),
-                    chunk_act.astype(np.float32)
-                ))
+                img_list.append(img_t)
+                proprio_list.append(window_proprio)
+                prompt_list.append(prompt_tok)
+                act_list.append(chunk_act)
 
-        print(f"Loaded {len(files)} episodes -> {len(self.samples)} Multimodal SmolVLA samples (Horizon={chunk_size}).")
+        # Pre-convert everything into single contiguous PyTorch tensors in memory
+        self.imgs_tensor = torch.tensor(np.array(img_list, dtype=np.float32), dtype=torch.float32)
+        self.proprio_tensor = torch.tensor(np.array(proprio_list, dtype=np.float32), dtype=torch.float32)
+        self.prompt_tensor = torch.tensor(np.array(prompt_list, dtype=np.int64), dtype=torch.int64)
+        self.acts_tensor = torch.tensor(np.array(act_list, dtype=np.float32), dtype=torch.float32)
+
+        print(f"Loaded {len(files)} episodes -> {len(self.imgs_tensor)} Multimodal SmolVLA samples into RAM.")
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.imgs_tensor)
 
     def __getitem__(self, idx):
-        img, proprio_seq, prompt, chunk_act = self.samples[idx]
-        return torch.tensor(img), torch.tensor(proprio_seq), torch.tensor(prompt), torch.tensor(chunk_act)
+        return self.imgs_tensor[idx], self.proprio_tensor[idx], self.prompt_tensor[idx], self.acts_tensor[idx]
 
 
 # -----------------------------------------------------------------------------
@@ -177,8 +183,8 @@ class VisionPatchEncoder(nn.Module):
 class ActionExpertCrossAttentionBlock(nn.Module):
     """
     Action Expert Transformer Block (SmolVLA / Pi0):
-    - Causal Self-Attention over future action tokens (ensures trajectory smoothness)
-    - Cross-Attention over VLM layer tokens (conditions actions on vision + language)
+    - Causal Self-Attention over future action tokens
+    - Cross-Attention over VLM layer tokens
     - Feed-Forward MLP
     """
     def __init__(self, d_model=128, nhead=4, dim_feedforward=256):
@@ -210,16 +216,7 @@ class ActionExpertCrossAttentionBlock(nn.Module):
 
 class SmolVLAPolicy(nn.Module):
     """
-    Complete SmolVLA / Pi0 Vision-Language-Action Policy:
-    1. Vision Encoder: Raw RGB Camera Image [3, 64, 64] -> Visual Tokens [B, 16, D]
-    2. Language Embedder: Instruction Prompt -> Text Tokens [B, 14, D]
-    3. Proprioception Projector: Robot State History [T_obs=8, 5] -> State Tokens [B, 8, D]
-    4. SmolVLM-2 Perception Backbone: Multi-Modal Transformer extracting representations across all layers.
-    5. Action Expert: Cross-Attention Decoder over all intermediate VLM layers.
-    6. Multi-Head Action & Success Output:
-       - Continuous Motion Chunk [B, H=8, 4] (dx, dy, dz, dyaw)
-       - Discrete Gripper Chunk [B, H=8, 1]
-       - Self-Evaluated Task Success [B, 1]
+    Complete SmolVLA / Pi0 Vision-Language-Action Policy
     """
     def __init__(self, vocab_size=len(VOCAB), chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3):
         super().__init__()
@@ -302,14 +299,19 @@ class SmolVLAPolicy(nn.Module):
 DobotActionChunkTransformer = SmolVLAPolicy
 
 
-def train(epochs=180, batch_size=128, lr=5e-4):
+def train(epochs=120, batch_size=256, lr=7e-4):
     print("=" * 68)
-    print("   SmolVLA / Pi0 Multimodal Generalist Policy Training")
-    print("   (With Distractor Clutter, Language Grounding & Color Alignment)")
+    print("   SmolVLA / Pi0 High-Speed Multimodal Policy Training")
+    print(f"   (Optimized: Batch Size={batch_size}, CPU Threads={NUM_THREADS}, Pre-Tensorized RAM)")
     print("=" * 68)
 
     dataset = SmolVLAMultimodalDataset(DATA_DIR, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=False
+    )
 
     model = SmolVLAPolicy(vocab_size=len(VOCAB), chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3)
 
@@ -336,7 +338,7 @@ def train(epochs=180, batch_size=128, lr=5e-4):
     bce_loss_fn = nn.BCEWithLogitsLoss()
     axis_weights = torch.tensor([1.0, 1.0, 4.0, 1.0], dtype=torch.float32)
 
-    print(f"\n>> Training SmolVLA Model on CPU across {len(dataset)} Action-Chunks ({epochs} epochs)...")
+    print(f"\n>> Accelerating Training across {len(dataset)} samples ({epochs} epochs)...")
 
     best_loss = float('inf')
 
@@ -349,7 +351,7 @@ def train(epochs=180, batch_size=128, lr=5e-4):
             total_succ = 0.0
 
             for img_batch, proprio_batch, prompt_batch, target_chunk in dataloader:
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 pred_motion_chunk, pred_grip_chunk, pred_succ = model(img_batch, proprio_batch, prompt_batch)
 
                 target_motion = target_chunk[:, :, :4]
@@ -377,12 +379,11 @@ def train(epochs=180, batch_size=128, lr=5e-4):
             avg_grip = total_grip / len(dataset)
             avg_succ = total_succ / len(dataset)
 
-            # Checkpoint whenever loss improves or at every epoch milestone
             if avg_loss < best_loss or epoch % 10 == 0:
                 best_loss = min(best_loss, avg_loss)
                 torch.save(model.state_dict(), model_path)
 
-            if epoch % 20 == 0 or epoch == 1 or epoch == epochs:
+            if epoch % 10 == 0 or epoch == 1 or epoch == epochs:
                 print(f"Epoch [{epoch:03d}/{epochs}] - Total: {avg_loss:.5f} | Motion: {avg_motion:.5f} | Grip: {avg_grip:.5f} | Succ: {avg_succ:.5f} | LR: {scheduler.get_last_lr()[0]:.6f}")
 
     except KeyboardInterrupt:
