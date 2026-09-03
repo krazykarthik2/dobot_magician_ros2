@@ -38,14 +38,25 @@ class DobotKinematics:
         j4 = yaw - j1
         return np.array([j1, j2, j3, j4], dtype=np.float32)
 
+COLOR_PALETTE = {
+    "red": (240, 45, 45),
+    "blue": (45, 120, 240),
+    "yellow": (240, 220, 45),
+    "green": (40, 210, 80),
+    "purple": (180, 50, 230),
+    "orange": (245, 140, 30),
+    "cyan": (35, 220, 225)
+}
+
 class DobotPickPlaceSim:
     """
-    Simulation Environment for Vision-Language-Action (VLA) Learning:
-    - Robot Base Origin: (0, 0, 0)
-    - Multimodal Observations:
-        * RGB Camera Image: [3, 64, 64] raw pixel visual feed (top-down / side scene)
+    Simulation Environment for Vision-Language-Action (VLA) Learning with Visual Distractors:
+    - Multi-object visual scene (Target Object + Distractor Objects + Target Platform + Distractor Platforms)
+    - Instruction-conditioned tasks (e.g. "pick red cube and place on green platform", "pick blue cube...", etc.)
+    - Modalities:
+        * RGB Camera Image: [3, 64, 64] float32 in [0, 1]
         * Proprioception Robot State: [ee_x, ee_y, ee_z, ee_yaw, gripper_status] (5 dims)
-        * Language Instruction: string prompt
+        * Language Instruction: prompt string
     """
     def __init__(self):
         self.kin = DobotKinematics()
@@ -55,88 +66,154 @@ class DobotPickPlaceSim:
         
         # State
         self.ee_pos = np.array([0.20, 0.0, 0.12, 0.0], dtype=np.float32)
-        self.cube_pos = np.array([0.22, 0.12, 0.011], dtype=np.float32)
-        self.platform_pos = np.array([0.22, -0.15, 0.005], dtype=np.float32)
-        self.instruction = "pick up the red cube and place it on the green platform"
+        self.target_color = "red"
+        self.target_cube_pos = np.array([0.22, 0.12, 0.011], dtype=np.float32)
+        self.target_plat_color = "green"
+        self.target_platform_pos = np.array([0.22, -0.15, 0.005], dtype=np.float32)
         
-        # Offscreen camera surface for rendering raw RGB vision
+        # Distractors
+        self.distractor_cubes = []      # list of (color_name, np.array([x, y, z]))
+        self.distractor_platforms = []  # list of (color_name, np.array([x, y, z]))
+
+        self.instruction = f"pick up the {self.target_color} cube and place it on the {self.target_plat_color} platform"
+        
+        # Pygame surface for camera rendering
         pygame.init()
         self.cam_surface = pygame.Surface((64, 64))
         self.reset()
 
-    def reset(self, random_scene=True, prompt=None):
+    # Aliases for backward compatibility
+    @property
+    def cube_pos(self):
+        return self.target_cube_pos
+
+    @cube_pos.setter
+    def cube_pos(self, val):
+        self.target_cube_pos = np.array(val, dtype=np.float32)
+
+    @property
+    def platform_pos(self):
+        return self.target_platform_pos
+
+    @platform_pos.setter
+    def platform_pos(self, val):
+        self.target_platform_pos = np.array(val, dtype=np.float32)
+
+    def reset(self, random_scene=True, prompt=None, num_distractors=2):
         self.ee_pos = np.array([0.20, 0.0, 0.12, 0.0], dtype=np.float32)
         self.gripper_closed = False
         self.grasped = False
 
-        if prompt is not None:
-            self.instruction = prompt
-        else:
-            prompts = [
-                "pick up the red cube and place it on the green platform",
-                "grasp the red cube and move to green box",
-                "transfer red block onto green platform",
-                "pick red object and place on green target"
-            ]
-            self.instruction = np.random.choice(prompts)
-
         if random_scene:
-            # 1. Random Red Cube Position
-            angle_c = np.random.uniform(-0.65, 0.65)
-            dist_c = np.random.uniform(0.18, 0.28)
-            cx = dist_c * np.cos(angle_c)
-            cy = dist_c * np.sin(angle_c)
-            self.cube_pos = np.array([cx, cy, 0.011], dtype=np.float32)
+            # 1. Randomize Target Object and Platform Colors
+            cube_colors = ["red", "blue", "yellow", "purple"]
+            plat_colors = ["green", "cyan", "orange"]
 
-            # 2. Random Green Platform Position
-            while True:
-                angle_p = np.random.uniform(-0.75, 0.75)
-                dist_p = np.random.uniform(0.18, 0.28)
-                px = dist_p * np.cos(angle_p)
-                py = dist_p * np.sin(angle_p)
-                if np.hypot(px - cx, py - cy) > 0.10:
-                    self.platform_pos = np.array([px, py, 0.005], dtype=np.float32)
-                    break
+            self.target_color = np.random.choice(cube_colors)
+            self.target_plat_color = np.random.choice(plat_colors)
+
+            # 2. Spawn Positions ensuring non-overlapping clutter
+            occupied_positions = []
+
+            def get_non_overlapping_pos(min_dist=0.065):
+                for _ in range(100):
+                    angle = np.random.uniform(-0.75, 0.75)
+                    dist = np.random.uniform(0.17, 0.29)
+                    pos = np.array([dist * np.cos(angle), dist * np.sin(angle), 0.011], dtype=np.float32)
+                    if all(np.linalg.norm(pos[:2] - p[:2]) > min_dist for p in occupied_positions):
+                        occupied_positions.append(pos)
+                        return pos
+                return np.array([0.22, 0.10, 0.011], dtype=np.float32)
+
+            self.target_cube_pos = get_non_overlapping_pos()
+            plat_pos = get_non_overlapping_pos(min_dist=0.08)
+            plat_pos[2] = 0.005
+            self.target_platform_pos = plat_pos
+
+            # 3. Spawn Distractor Objects
+            self.distractor_cubes = []
+            avail_cube_colors = [c for c in cube_colors if c != self.target_color]
+            np.random.shuffle(avail_cube_colors)
+            for i in range(min(num_distractors, len(avail_cube_colors))):
+                d_pos = get_non_overlapping_pos()
+                self.distractor_cubes.append((avail_cube_colors[i], d_pos))
+
+            # 4. Spawn Distractor Platform
+            self.distractor_platforms = []
+            avail_plat_colors = [c for c in plat_colors if c != self.target_plat_color]
+            if avail_plat_colors:
+                dp_pos = get_non_overlapping_pos(min_dist=0.08)
+                dp_pos[2] = 0.005
+                self.distractor_platforms.append((avail_plat_colors[0], dp_pos))
+
+            # 5. Language Instruction Prompt
+            if prompt is not None:
+                self.instruction = prompt
+            else:
+                prompt_templates = [
+                    f"pick up the {self.target_color} cube and place it on the {self.target_plat_color} platform",
+                    f"grasp the {self.target_color} cube and move to {self.target_plat_color} box",
+                    f"transfer {self.target_color} block onto {self.target_plat_color} platform",
+                    f"pick {self.target_color} object and place on {self.target_plat_color} target"
+                ]
+                self.instruction = np.random.choice(prompt_templates)
         else:
-            self.cube_pos = np.array([0.22, 0.12, 0.011], dtype=np.float32)
-            self.platform_pos = np.array([0.22, -0.15, 0.005], dtype=np.float32)
+            self.target_color = "red"
+            self.target_plat_color = "green"
+            self.target_cube_pos = np.array([0.22, 0.12, 0.011], dtype=np.float32)
+            self.target_platform_pos = np.array([0.22, -0.15, 0.005], dtype=np.float32)
+            self.distractor_cubes = [("blue", np.array([0.20, -0.05, 0.011], dtype=np.float32))]
+            self.distractor_platforms = [("cyan", np.array([0.18, 0.18, 0.005], dtype=np.float32))]
+            self.instruction = "pick up the red cube and place it on the green platform"
 
         return self.get_vla_observation()
 
     def render_camera_rgb(self):
         """
-        Renders an overhead / perspective camera view as a [3, 64, 64] float32 RGB tensor normalized to [0, 1].
+        Renders an overhead RGB camera view with clutter/distractors as [3, 64, 64] float32 in [0, 1].
         """
         surf = self.cam_surface
-        surf.fill((30, 32, 40)) # Dark workspace mat background
+        surf.fill((30, 32, 40)) # Dark workspace table mat
 
-        # World coordinates (x: 0.10..0.35, y: -0.25..0.25) to 64x64 pixel frame
         def to_cam_px(x, y):
             px = int(32 + (y / 0.28) * 28)
             py = int(58 - ((x - 0.10) / 0.25) * 52)
             return px, py
 
-        # 1. Draw Green Platform
-        gx, gy = to_cam_px(self.platform_pos[0], self.platform_pos[1])
-        pygame.draw.rect(surf, (40, 210, 80), (gx - 5, gy - 5, 10, 10), border_radius=1)
+        # 1. Draw Distractor Platforms
+        for plat_color, p_pos in self.distractor_platforms:
+            gx, gy = to_cam_px(p_pos[0], p_pos[1])
+            col = COLOR_PALETTE.get(plat_color, (40, 210, 80))
+            pygame.draw.rect(surf, col, (gx - 5, gy - 5, 10, 10), border_radius=1)
 
-        # 2. Draw Red Cube
-        cx, cy = to_cam_px(self.cube_pos[0], self.cube_pos[1])
-        pygame.draw.rect(surf, (240, 45, 45), (cx - 3, cy - 3, 6, 6))
+        # 2. Draw Target Platform
+        tgx, tgy = to_cam_px(self.target_platform_pos[0], self.target_platform_pos[1])
+        t_col = COLOR_PALETTE.get(self.target_plat_color, (40, 210, 80))
+        pygame.draw.rect(surf, t_col, (tgx - 5, tgy - 5, 10, 10), border_radius=1)
 
-        # 3. Draw Robot Base Origin
+        # 3. Draw Distractor Cubes
+        for cube_color, c_pos in self.distractor_cubes:
+            cx, cy = to_cam_px(c_pos[0], c_pos[1])
+            col = COLOR_PALETTE.get(cube_color, (45, 120, 240))
+            pygame.draw.rect(surf, col, (cx - 3, cy - 3, 6, 6))
+
+        # 4. Draw Target Cube
+        tcx, tcy = to_cam_px(self.target_cube_pos[0], self.target_cube_pos[1])
+        tc_col = COLOR_PALETTE.get(self.target_color, (240, 45, 45))
+        pygame.draw.rect(surf, tc_col, (tcx - 3, tcy - 3, 6, 6))
+
+        # 5. Draw Robot Base Origin
         bx, by = to_cam_px(0.08, 0.0)
         pygame.draw.circle(surf, (90, 95, 115), (bx, by), 5)
 
-        # 4. Draw Robot Arm Linkage
+        # 6. Draw Robot Arm Linkage
         ex, ey = to_cam_px(self.ee_pos[0], self.ee_pos[1])
         pygame.draw.line(surf, (170, 175, 195), (bx, by), (ex, ey), 2)
 
-        # 5. Draw Robot End-Effector Gripper
+        # 7. Draw Gripper End-Effector
         grip_color = (255, 90, 90) if self.gripper_closed else (90, 200, 255)
         pygame.draw.circle(surf, grip_color, (ex, ey), 3)
 
-        # Extract RGB array: [64, 64, 3] -> [3, 64, 64] float32 in [0, 1]
         rgb_hwc = pygame.surfarray.array3d(surf) # [64, 64, 3]
         rgb_chw = np.transpose(rgb_hwc, (2, 1, 0)).astype(np.float32) / 255.0
         return rgb_chw
@@ -151,19 +228,19 @@ class DobotPickPlaceSim:
     def get_vla_observation(self):
         """Returns complete Vision-Language-Action observation dictionary."""
         return {
-            "image": self.render_camera_rgb(),        # [3, 64, 64] RGB pixel image
-            "proprio": self.get_proprioception(),     # [5] EE pose + gripper
-            "prompt": self.instruction                # Natural language prompt string
+            "image": self.render_camera_rgb(),
+            "proprio": self.get_proprioception(),
+            "prompt": self.instruction
         }
 
     def get_observation(self):
-        """Legacy 11-dim state observation for compatibility."""
+        """Legacy observation format."""
         grip_val = 1.0 if self.gripper_closed else 0.0
         return np.array([
             self.ee_pos[0], self.ee_pos[1], self.ee_pos[2], self.ee_pos[3],
             grip_val,
-            self.cube_pos[0], self.cube_pos[1], self.cube_pos[2],
-            self.platform_pos[0], self.platform_pos[1], self.platform_pos[2]
+            self.target_cube_pos[0], self.target_cube_pos[1], self.target_cube_pos[2],
+            self.target_platform_pos[0], self.target_platform_pos[1], self.target_platform_pos[2]
         ], dtype=np.float32)
 
     def step_delta(self, delta_action, max_step=0.006):
@@ -186,9 +263,9 @@ class DobotPickPlaceSim:
         self.gripper_closed = bool(target_ee[4] > 0.5)
 
         ee_xyz = self.ee_pos[:3]
-        dist_to_cube = np.linalg.norm(ee_xyz - self.cube_pos)
+        dist_to_cube = np.linalg.norm(ee_xyz - self.target_cube_pos)
 
-        # Grasping physics
+        # Grasping physics for target object
         if self.gripper_closed:
             if dist_to_cube < 0.032:
                 self.grasped = True
@@ -196,15 +273,15 @@ class DobotPickPlaceSim:
             self.grasped = False
 
         if self.grasped:
-            self.cube_pos = ee_xyz.copy()
-            self.cube_pos[2] = max(self.cube_pos[2] - 0.015, 0.011)
+            self.target_cube_pos = ee_xyz.copy()
+            self.target_cube_pos[2] = max(self.target_cube_pos[2] - 0.015, 0.011)
         else:
-            if self.cube_pos[2] > 0.011:
-                self.cube_pos[2] = max(self.cube_pos[2] - 0.01, 0.011)
+            if self.target_cube_pos[2] > 0.011:
+                self.target_cube_pos[2] = max(self.target_cube_pos[2] - 0.01, 0.011)
 
         obs = self.get_vla_observation()
         
-        dist_to_goal = np.linalg.norm(self.cube_pos[:2] - self.platform_pos[:2])
-        is_success = bool(dist_to_goal < 0.04 and self.cube_pos[2] <= 0.025 and not self.gripper_closed)
+        dist_to_goal = np.linalg.norm(self.target_cube_pos[:2] - self.target_platform_pos[:2])
+        is_success = bool(dist_to_goal < 0.04 and self.target_cube_pos[2] <= 0.025 and not self.gripper_closed)
 
         return obs, is_success

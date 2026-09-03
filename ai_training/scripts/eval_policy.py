@@ -6,7 +6,7 @@ import numpy as np
 import pygame
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "env"))
-from dobot_env import DobotPickPlaceSim
+from dobot_env import DobotPickPlaceSim, COLOR_PALETTE
 from train_imitation import SmolVLAPolicy, tokenize_prompt, VOCAB, MODEL_DIR, WINDOW_SIZE, CHUNK_SIZE
 
 def world_to_screen(x, y):
@@ -26,13 +26,29 @@ def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, mod
     pygame.draw.rect(screen, (35, 38, 48), (20, 20, 360, 360), border_radius=8)
     pygame.draw.circle(screen, (70, 75, 95), (200, 350), 30, 2)
     
-    # Platform (Top)
-    px, py = world_to_screen(sim.platform_pos[0], sim.platform_pos[1])
-    pygame.draw.rect(screen, (40, 200, 70), (px - 20, py - 20, 40, 40), border_radius=4)
+    # 1. Distractor Platforms
+    for p_col, p_pos in sim.distractor_platforms:
+        px, py = world_to_screen(p_pos[0], p_pos[1])
+        col = COLOR_PALETTE.get(p_col, (40, 210, 80))
+        pygame.draw.rect(screen, col, (px - 18, py - 18, 36, 36), border_radius=4)
+
+    # 2. Target Platform
+    tpx, tpy = world_to_screen(sim.target_platform_pos[0], sim.target_platform_pos[1])
+    t_col = COLOR_PALETTE.get(sim.target_plat_color, (40, 210, 80))
+    pygame.draw.rect(screen, t_col, (tpx - 20, tpy - 20, 40, 40), border_radius=4)
+    pygame.draw.rect(screen, (255, 255, 255), (tpx - 20, tpy - 20, 40, 40), 2, border_radius=4)
     
-    # Cube (Top)
-    cx, cy = world_to_screen(sim.cube_pos[0], sim.cube_pos[1])
-    pygame.draw.rect(screen, (230, 45, 45), (cx - 10, cy - 10, 20, 20), border_radius=2)
+    # 3. Distractor Cubes
+    for c_col, c_pos in sim.distractor_cubes:
+        cx, cy = world_to_screen(c_pos[0], c_pos[1])
+        col = COLOR_PALETTE.get(c_col, (45, 120, 240))
+        pygame.draw.rect(screen, col, (cx - 9, cy - 9, 18, 18), border_radius=2)
+
+    # 4. Target Cube
+    tcx, tcy = world_to_screen(sim.target_cube_pos[0], sim.target_cube_pos[1])
+    tc_col = COLOR_PALETTE.get(sim.target_color, (240, 45, 45))
+    pygame.draw.rect(screen, tc_col, (tcx - 10, tcy - 10, 20, 20), border_radius=2)
+    pygame.draw.rect(screen, (255, 255, 255), (tcx - 10, tcy - 10, 20, 20), 2, border_radius=2)
     
     # End-Effector (Top)
     ex, ey = world_to_screen(sim.ee_pos[0], sim.ee_pos[1])
@@ -40,29 +56,26 @@ def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, mod
     pygame.draw.circle(screen, grip_color, (ex, ey), 8)
     pygame.draw.line(screen, (160, 170, 190), (200, 350), (ex, ey), 3)
 
-    top_label = font.render("TOP-DOWN WORKSPACE", True, (170, 180, 200))
+    top_label = font.render(f"TOP-DOWN VIEW (Target: {sim.target_color.upper()} -> {sim.target_plat_color.upper()})", True, (170, 180, 200))
     screen.blit(top_label, (30, 30))
 
     # Side Elevation Panel
     pygame.draw.rect(screen, (35, 38, 48), (400, 20, 360, 360), border_radius=8)
     pygame.draw.line(screen, (60, 65, 80), (410, 350), (750, 350), 2)
     
-    # Platform (Side)
-    psx, psy = world_to_side_screen(sim.platform_pos[0], sim.platform_pos[2])
-    pygame.draw.rect(screen, (40, 200, 70), (psx - 20, psy - 4, 40, 8), border_radius=2)
+    psx, psy = world_to_side_screen(sim.target_platform_pos[0], sim.target_platform_pos[2])
+    pygame.draw.rect(screen, t_col, (psx - 20, psy - 4, 40, 8), border_radius=2)
 
-    # Cube (Side)
-    csx, csy = world_to_side_screen(sim.cube_pos[0], sim.cube_pos[2])
-    pygame.draw.rect(screen, (230, 45, 45), (csx - 8, csy - 8, 16, 16), border_radius=2)
+    csx, csy = world_to_side_screen(sim.target_cube_pos[0], sim.target_cube_pos[2])
+    pygame.draw.rect(screen, tc_col, (csx - 8, csy - 8, 16, 16), border_radius=2)
 
-    # End-Effector (Side)
     esx, esy = world_to_side_screen(sim.ee_pos[0], sim.ee_pos[2])
     pygame.draw.circle(screen, grip_color, (esx, esy), 8)
 
-    side_label = font.render("SIDE ELEVATION", True, (170, 180, 200))
+    side_label = font.render("SIDE ELEVATION VIEW", True, (170, 180, 200))
     screen.blit(side_label, (410, 30))
 
-    # Inset Camera Feed (SmolVLA Visual Input)
+    # Inset Camera Feed (SmolVLA Visual Input with Distractors)
     if cam_img is not None:
         img_hwc = (np.transpose(cam_img, (2, 1, 0)) * 255).astype(np.uint8)
         cam_surf = pygame.surfarray.make_surface(img_hwc)
@@ -81,19 +94,19 @@ def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, mod
     steps_str = f"Step: {step} / {max_steps}"
     screen.blit(font.render(steps_str, True, (200, 200, 210)), (580, 408))
 
-    prompt_str = f"Task Prompt: \"{sim.instruction}\""
+    prompt_str = f"Instruction: \"{sim.instruction}\""
     screen.blit(font_bold.render(prompt_str, True, (255, 230, 120)), (35, 432))
 
     # Display Model's Self-Evaluated Success Confidence
     succ_color = (80, 255, 120) if model_succ_prob > 0.60 else (200, 200, 210)
-    conf_str = f"SmolVLA Confidence: {model_succ_prob*100:.1f}%"
+    conf_str = f"Task Confidence: {model_succ_prob*100:.1f}%"
     screen.blit(font_bold.render(conf_str, True, succ_color), (35, 458))
 
     if is_success:
-        succ_label = font_bold.render("[TASK COMPLETED: CUBE PLACED!]", True, (80, 255, 120))
+        succ_label = font_bold.render("[TASK COMPLETED: OBJECT PLACED!]", True, (80, 255, 120))
         screen.blit(succ_label, (350, 458))
 
-    info_str = font.render(f"EE: [{sim.ee_pos[0]:.2f}, {sim.ee_pos[1]:.2f}, {sim.ee_pos[2]:.2f}] | Goal: [{sim.platform_pos[0]:.2f}, {sim.platform_pos[1]:.2f}] | [ESC] Exit", True, (140, 145, 160))
+    info_str = font.render(f"EE: [{sim.ee_pos[0]:.2f}, {sim.ee_pos[1]:.2f}, {sim.ee_pos[2]:.2f}] | Clutter: {len(sim.distractor_cubes)} distractors | [ESC] Exit", True, (140, 145, 160))
     screen.blit(info_str, (35, 485))
 
     pygame.display.flip()
@@ -122,7 +135,7 @@ def evaluate(episodes=10):
 
     pygame.init()
     screen = pygame.display.set_mode((780, 520))
-    pygame.display.set_caption("Dobot SmolVLA / Pi0 Multimodal Autopilot")
+    pygame.display.set_caption("Dobot SmolVLA Distractor Clutter Autopilot")
     font = pygame.font.SysFont("Arial", 14)
     font_bold = pygame.font.SysFont("Arial", 16, bold=True)
     clock = pygame.time.Clock()
@@ -135,18 +148,19 @@ def evaluate(episodes=10):
     exp_weights = exp_weights / exp_weights.sum()
 
     print("=" * 68)
-    print("   Testing SmolVLA / Pi0 Multimodal Generalist Policy")
-    print("   (Vision 64x64 + Language Prompt + 5D Proprioception)")
+    print("   Testing SmolVLA Policy with Clutter & Visual Distractors")
     print("=" * 68)
 
     for ep in range(1, episodes + 1):
-        obs_dict = sim.reset(random_scene=True)
+        obs_dict = sim.reset(random_scene=True, num_distractors=2)
         prompt_text = sim.instruction
-        prompt_tok = torch.tensor(tokenize_prompt(prompt_text), dtype=torch.int64).unsqueeze(0) # [1, 12]
+        prompt_tok = torch.tensor(tokenize_prompt(prompt_text), dtype=torch.int64).unsqueeze(0)
 
         print(f"\nEpisode {ep}/{episodes}")
-        print(f">> Prompt: \"{prompt_text}\"")
-        print(f">> Cube: [{sim.cube_pos[0]:.3f}, {sim.cube_pos[1]:.3f}] | Platform: [{sim.platform_pos[0]:.3f}, {sim.platform_pos[1]:.3f}]")
+        print(f">> Task: \"{prompt_text}\"")
+        print(f">> Target Object ({sim.target_color.upper()}): [{sim.target_cube_pos[0]:.3f}, {sim.target_cube_pos[1]:.3f}]")
+        print(f">> Target Platform ({sim.target_plat_color.upper()}): [{sim.target_platform_pos[0]:.3f}, {sim.target_platform_pos[1]:.3f}]")
+        print(f">> Distractor Cubes: {[c for c, _ in sim.distractor_cubes]}")
         
         proprio_init = (obs_dict["proprio"] - proprio_mean) / proprio_std
         proprio_history = [proprio_init.copy() for _ in range(window_size)]
@@ -167,18 +181,15 @@ def evaluate(episodes=10):
             if aborted:
                 break
 
-            # 1. Prepare inputs for Multimodal SmolVLA
-            img_t = torch.tensor(obs_dict["image"], dtype=torch.float32).unsqueeze(0) # [1, 3, 64, 64]
-            proprio_t = torch.tensor(np.array([proprio_history]), dtype=torch.float32) # [1, T_obs, 5]
+            # 1. Inference with Vision + Language + Proprioception
+            img_t = torch.tensor(obs_dict["image"], dtype=torch.float32).unsqueeze(0)
+            proprio_t = torch.tensor(np.array([proprio_history]), dtype=torch.float32)
 
             with torch.no_grad():
                 pred_motion_chunk, pred_grip_chunk, pred_succ_logit = model(img_t, proprio_t, prompt_tok)
                 
-                # Denormalize motion
                 pred_motion = (pred_motion_chunk.squeeze(0).numpy() * motion_std) + motion_mean
-                # Gripper probabilities
                 pred_grip = torch.sigmoid(pred_grip_chunk).squeeze(0).numpy()
-                # Self-evaluated success confidence
                 model_succ_prob = torch.sigmoid(pred_succ_logit).item()
 
             new_chunk = np.concatenate([pred_motion, pred_grip], axis=-1)
@@ -209,7 +220,6 @@ def evaluate(episodes=10):
             if is_succ or model_succ_prob > 0.85:
                 ep_success = True
 
-            # Update proprioception history
             norm_proprio = (obs_dict["proprio"] - proprio_mean) / proprio_std
             proprio_history.pop(0)
             proprio_history.append(norm_proprio)
@@ -225,7 +235,7 @@ def evaluate(episodes=10):
 
         if ep_success:
             successes += 1
-            print(f"Episode {ep}: SUCCESS! Task executed.")
+            print(f"Episode {ep}: SUCCESS! Picked correct target and placed on goal.")
         else:
             print(f"Episode {ep}: Failed.")
 

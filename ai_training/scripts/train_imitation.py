@@ -16,15 +16,16 @@ WINDOW_SIZE = 8   # Sequence window (T_obs = 8 past states)
 CHUNK_SIZE = 8    # Future trajectory chunk horizon (H_action = 8)
 
 # -----------------------------------------------------------------------------
-# 1. Simple Robust Character/Word Language Tokenizer
+# 1. Expanded Language Vocabulary for Multi-Object & Color Grounding
 # -----------------------------------------------------------------------------
 VOCAB = [
-    "<pad>", "<unk>", "pick", "up", "the", "red", "cube", "block", "object",
-    "and", "place", "it", "on", "green", "platform", "box", "target",
-    "grasp", "move", "to", "transfer", "onto"
+    "<pad>", "<unk>", "pick", "up", "the", "cube", "block", "object",
+    "and", "place", "it", "on", "platform", "box", "target", "grasp", "move", "to", "transfer", "onto",
+    # Color tokens for visual grounding
+    "red", "blue", "yellow", "green", "purple", "orange", "cyan"
 ]
 WORD_TO_IDX = {w: i for i, w in enumerate(VOCAB)}
-MAX_PROMPT_LEN = 12
+MAX_PROMPT_LEN = 14
 
 def tokenize_prompt(prompt_text, max_len=MAX_PROMPT_LEN):
     tokens = prompt_text.lower().replace(".", "").replace(",", "").split()
@@ -34,15 +35,15 @@ def tokenize_prompt(prompt_text, max_len=MAX_PROMPT_LEN):
     return np.array(indices, dtype=np.int64)
 
 # -----------------------------------------------------------------------------
-# 2. Multimodal VLA Dataset (Vision + Language + Proprioception)
+# 2. Multimodal VLA Dataset (Vision with Distractors + Language + Proprioception)
 # -----------------------------------------------------------------------------
 class SmolVLAMultimodalDataset(Dataset):
     """
     Multimodal Dataset for SmolVLA / Pi0:
     Inputs:
-      - RGB Camera Frame Image: [3, 64, 64]
+      - RGB Camera Frame Image: [3, 64, 64] with visual distractors & clutter
       - Past Proprioception Window: [T_obs=8, 5] (EE pos + gripper)
-      - Tokenized Language Instruction: [max_len=12]
+      - Tokenized Language Instruction: [max_len=14] (specifying target color & goal)
     Targets:
       - Future Action Trajectory Chunk: [H_action=8, 6]
         [dx, dy, dz, dyaw, gripper_cmd, success_signal]
@@ -65,12 +66,10 @@ class SmolVLAMultimodalDataset(Dataset):
         for f in files:
             data = np.load(f, allow_pickle=True)
             
-            # Check if multimodal keys exist
             if 'images' in data and 'proprioception' in data:
                 imgs = data['images']               # [N, 3, 64, 64]
                 proprio = data['proprioception']    # [N, 5]
             else:
-                # Fallback synthesized image from 11-dim observation
                 obs = data['observations']
                 N = len(obs)
                 imgs = np.zeros((N, 3, 64, 64), dtype=np.float32)
@@ -220,7 +219,7 @@ class SmolVLAPolicy(nn.Module):
     """
     Complete SmolVLA / Pi0 Vision-Language-Action Policy:
     1. Vision Encoder: Raw RGB Camera Image [3, 64, 64] -> Visual Tokens [B, 16, D]
-    2. Language Embedder: Instruction Prompt -> Text Tokens [B, 12, D]
+    2. Language Embedder: Instruction Prompt -> Text Tokens [B, 14, D]
     3. Proprioception Projector: Robot State History [T_obs=8, 5] -> State Tokens [B, 8, D]
     4. SmolVLM-2 Perception Backbone: Multi-Modal Transformer extracting representations across all layers.
     5. Action Expert: Cross-Attention Decoder over all intermediate VLM layers.
@@ -284,16 +283,16 @@ class SmolVLAPolicy(nn.Module):
     def forward(self, img, proprio_seq, prompt_tokens):
         # img: [B, 3, 64, 64]
         # proprio_seq: [B, T_obs=8, 5]
-        # prompt_tokens: [B, max_len=12]
+        # prompt_tokens: [B, max_len=14]
         batch_size = img.size(0)
 
         # Modality Token Projections
         vis_tokens = self.vision_encoder(img)              # [B, 16, D]
-        lang_tokens = self.lang_embedding(prompt_tokens)   # [B, 12, D]
+        lang_tokens = self.lang_embedding(prompt_tokens)   # [B, 14, D]
         proprio_tokens = self.proprio_proj(proprio_seq)    # [B, 8, D]
 
         # Multi-Modal Prefix Sequence: [Language + Vision + Proprioception]
-        multimodal_seq = torch.cat([lang_tokens, vis_tokens, proprio_tokens], dim=1) # [B, 36, D]
+        multimodal_seq = torch.cat([lang_tokens, vis_tokens, proprio_tokens], dim=1) # [B, 38, D]
 
         # Step 1: Extract all layer outputs from SmolVLM-2 Perception Backbone
         vlm_all_layers = []
@@ -313,7 +312,7 @@ class SmolVLAPolicy(nn.Module):
         grip_chunk_logits = self.gripper_head(act_tokens) # [B, H, 1]
 
         # Success evaluated from fused VLM multimodal context
-        fused_vlm = torch.cat(vlm_all_layers, dim=-1) # [B, 36, D * num_layers]
+        fused_vlm = torch.cat(vlm_all_layers, dim=-1) # [B, 38, D * num_layers]
         global_context = self.fusion_proj(fused_vlm).mean(dim=1) # [B, D]
         success_logit = self.success_head(global_context) # [B, 1]
 
@@ -327,7 +326,7 @@ DobotActionChunkTransformer = SmolVLAPolicy
 def train(epochs=180, batch_size=128, lr=5e-4):
     print("=" * 68)
     print("   SmolVLA / Pi0 Multimodal Generalist Policy Training")
-    print("   (Vision 64x64 + Language Instruction + 5D Proprioception)")
+    print("   (With Distractor Clutter, Language Grounding & Color Alignment)")
     print("=" * 68)
 
     dataset = SmolVLAMultimodalDataset(DATA_DIR, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE)
