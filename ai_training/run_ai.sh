@@ -11,14 +11,15 @@ echo ""
 echo "  [1] Auto-Generate 50 Expert Demonstrations (Visual & Fast)"
 echo "  [2] Manual Teleoperation Recorder          (Keyboard GUI)"
 echo "  [3] Train Imitation Model                  (Fast CPU Behavior Cloning)"
-echo "  [4] Test / Autopilot Replay                (Evaluate on novel cubes)"
+echo "  [4] Test / Autopilot Replay                (Evaluate on novel scenes)"
 echo "  [5] Clear / Delete All Recorded Demos"
+echo "  [6] Delete Trained Policy Model Checkpoints (.pth / .npz)"
 echo "======================================================"
 
 if [ -n "$1" ]; then
     CHOICE="$1"
 elif [ -t 0 ]; then
-    read -p "Enter choice [1-5] (default: 1): " -n 1 -r CHOICE
+    read -p "Enter choice [1-6] (default: 1): " -n 1 -r CHOICE
     echo ""
 else
     CHOICE="1"
@@ -41,6 +42,11 @@ case "$CHOICE" in
         echo ">> Removing all recorded demonstrations..."
         rm -f "$DIR/data/demos"/*.npz
         echo ">> Demos folder cleared!"
+        ;;
+    6)
+        echo ">> Deleting trained policy model checkpoints and normalization stats..."
+        rm -f "$DIR/models"/*.pth "$DIR/models"/*.npz
+        echo ">> Trained model checkpoints successfully deleted!"
         ;;
     1|*)
         echo ">> Launching Auto-Demonstration Generator..."
