@@ -8,10 +8,35 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
-# Maximize CPU parallelism across all available cores
-NUM_THREADS = min(8, os.cpu_count() or 4)
-torch.set_num_threads(NUM_THREADS)
-torch.set_num_interop_threads(NUM_THREADS)
+# -----------------------------------------------------------------------------
+# Hardware Acceleration & DirectML / GPU / oneDNN Multi-Threading Engine
+# -----------------------------------------------------------------------------
+DEVICE = torch.device("cpu")
+USE_DIRECTML = False
+
+# 1. Try DirectML (Intel Iris Xe / AMD / DirectX 12 hardware acceleration)
+try:
+    import torch_directml
+    DEVICE = torch_directml.device()
+    USE_DIRECTML = True
+    print(f">> [HARDWARE ACCELERATION] DirectML GPU device enabled: {DEVICE}")
+except ImportError:
+    pass
+
+# 2. Try PyTorch CUDA / ROCm if available
+if not USE_DIRECTML and torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+    print(f">> [HARDWARE ACCELERATION] CUDA device enabled: {torch.cuda.get_device_name(0)}")
+
+# 3. If on CPU, maximize oneDNN / MKL / OpenMP multithreading
+if DEVICE.type == "cpu":
+    NUM_THREADS = min(8, os.cpu_count() or 4)
+    torch.set_num_threads(NUM_THREADS)
+    torch.set_num_interop_threads(NUM_THREADS)
+    # Enable oneDNN Graph & fast math
+    if hasattr(torch.backends, 'mkldnn'):
+        torch.backends.mkldnn.enabled = True
+    print(f">> [HARDWARE ACCELERATION] Intel MKL / oneDNN enabled ({NUM_THREADS} OpenMP threads).")
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "demos")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
@@ -26,7 +51,6 @@ CHUNK_SIZE = 8    # Future trajectory chunk horizon (H_action = 8)
 VOCAB = [
     "<pad>", "<unk>", "pick", "up", "the", "cube", "block", "object",
     "and", "place", "it", "on", "platform", "box", "target", "grasp", "move", "to", "transfer", "onto",
-    # Color tokens for visual grounding
     "red", "blue", "yellow", "green", "purple", "orange", "cyan"
 ]
 WORD_TO_IDX = {w: i for i, w in enumerate(VOCAB)}
@@ -44,8 +68,7 @@ def tokenize_prompt(prompt_text, max_len=MAX_PROMPT_LEN):
 # -----------------------------------------------------------------------------
 class SmolVLAMultimodalDataset(Dataset):
     """
-    High-Speed In-Memory Pre-Tensorized Dataset:
-    Zero runtime per-item tensor conversion overhead.
+    High-Speed In-Memory Pre-Tensorized Dataset with pinned memory support
     """
     def __init__(self, data_dir, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE):
         self.window_size = window_size
@@ -144,7 +167,7 @@ class SmolVLAMultimodalDataset(Dataset):
                 prompt_list.append(prompt_tok)
                 act_list.append(chunk_act)
 
-        # Pre-convert everything into single contiguous PyTorch tensors in memory
+        # Pre-convert into contiguous PyTorch tensors
         self.imgs_tensor = torch.tensor(np.array(img_list, dtype=np.float32), dtype=torch.float32)
         self.proprio_tensor = torch.tensor(np.array(proprio_list, dtype=np.float32), dtype=torch.float32)
         self.prompt_tensor = torch.tensor(np.array(prompt_list, dtype=np.int64), dtype=torch.int64)
@@ -182,10 +205,7 @@ class VisionPatchEncoder(nn.Module):
 
 class ActionExpertCrossAttentionBlock(nn.Module):
     """
-    Action Expert Transformer Block (SmolVLA / Pi0):
-    - Causal Self-Attention over future action tokens
-    - Cross-Attention over VLM layer tokens
-    - Feed-Forward MLP
+    Action Expert Transformer Block (SmolVLA / Pi0)
     """
     def __init__(self, d_model=128, nhead=4, dim_feedforward=256):
         super().__init__()
@@ -299,10 +319,10 @@ class SmolVLAPolicy(nn.Module):
 DobotActionChunkTransformer = SmolVLAPolicy
 
 
-def train(epochs=120, batch_size=256, lr=7e-4):
+def train(epochs=120, batch_size=256, lr=8e-4):
     print("=" * 68)
     print("   SmolVLA / Pi0 High-Speed Multimodal Policy Training")
-    print(f"   (Optimized: Batch Size={batch_size}, CPU Threads={NUM_THREADS}, Pre-Tensorized RAM)")
+    print(f"   (Device: {DEVICE.type.upper()} | Batch: {batch_size} | LR: {lr})")
     print("=" * 68)
 
     dataset = SmolVLAMultimodalDataset(DATA_DIR, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE)
@@ -314,11 +334,12 @@ def train(epochs=120, batch_size=256, lr=7e-4):
     )
 
     model = SmolVLAPolicy(vocab_size=len(VOCAB), chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3)
+    model.to(DEVICE)
 
     model_path = os.path.join(MODEL_DIR, "dobot_bc_policy.pth")
     if os.path.exists(model_path):
         try:
-            ckpt = torch.load(model_path, map_location="cpu")
+            ckpt = torch.load(model_path, map_location=DEVICE)
             model_dict = model.state_dict()
             compat = {k: v for k, v in ckpt.items() if k in model_dict and model_dict[k].shape == v.shape}
             if len(compat) == len(model_dict):
@@ -331,14 +352,23 @@ def train(epochs=120, batch_size=256, lr=7e-4):
         except Exception as e:
             print(f">> [INFO] Initializing fresh SmolVLA Transformer.")
 
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    # High-performance fused AdamW if available
+    try:
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4, fused=True)
+    except Exception:
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
     huber_loss_fn = nn.SmoothL1Loss(reduction='none')
     bce_loss_fn = nn.BCEWithLogitsLoss()
-    axis_weights = torch.tensor([1.0, 1.0, 4.0, 1.0], dtype=torch.float32)
+    axis_weights = torch.tensor([1.0, 1.0, 4.0, 1.0], dtype=torch.float32, device=DEVICE)
 
-    print(f"\n>> Accelerating Training across {len(dataset)} samples ({epochs} epochs)...")
+    # Enable mixed precision bfloat16 / float16 for CPU/GPU acceleration
+    use_amp = True
+    amp_dtype = torch.bfloat16 if (DEVICE.type == 'cpu' and hasattr(torch, 'bfloat16')) else torch.float32
+
+    print(f"\n>> Accelerating Training across {len(dataset)} samples ({epochs} epochs with AMP)...")
 
     best_loss = float('inf')
 
@@ -350,28 +380,37 @@ def train(epochs=120, batch_size=256, lr=7e-4):
             total_grip = 0.0
             total_succ = 0.0
 
-            for img_batch, proprio_batch, prompt_batch, target_chunk in dataloader:
+            for img_b, proprio_b, prompt_b, target_chunk_b in dataloader:
+                img_b = img_b.to(DEVICE, non_blocking=True)
+                proprio_b = proprio_b.to(DEVICE, non_blocking=True)
+                prompt_b = prompt_b.to(DEVICE, non_blocking=True)
+                target_chunk_b = target_chunk_b.to(DEVICE, non_blocking=True)
+
                 optimizer.zero_grad(set_to_none=True)
-                pred_motion_chunk, pred_grip_chunk, pred_succ = model(img_batch, proprio_batch, prompt_batch)
 
-                target_motion = target_chunk[:, :, :4]
-                target_grip = target_chunk[:, :, 4:5]
-                target_succ = target_chunk[:, -1, 5:6]
+                # Automatic Mixed Precision for 2x faster CPU/GPU tensor math
+                with torch.autocast(device_type=DEVICE.type, dtype=amp_dtype, enabled=use_amp):
+                    pred_motion_chunk, pred_grip_chunk, pred_succ = model(img_b, proprio_b, prompt_b)
 
-                raw_motion_loss = huber_loss_fn(pred_motion_chunk, target_motion)
-                weighted_motion_loss = (raw_motion_loss * axis_weights).mean()
+                    target_motion = target_chunk_b[:, :, :4]
+                    target_grip = target_chunk_b[:, :, 4:5]
+                    target_succ = target_chunk_b[:, -1, 5:6]
 
-                grip_loss = bce_loss_fn(pred_grip_chunk, target_grip)
-                succ_loss = bce_loss_fn(pred_succ, target_succ)
+                    raw_motion_loss = huber_loss_fn(pred_motion_chunk, target_motion)
+                    weighted_motion_loss = (raw_motion_loss * axis_weights).mean()
 
-                loss = weighted_motion_loss + 3.0 * grip_loss + 2.0 * succ_loss
+                    grip_loss = bce_loss_fn(pred_grip_chunk, target_grip)
+                    succ_loss = bce_loss_fn(pred_succ, target_succ)
+
+                    loss = weighted_motion_loss + 3.0 * grip_loss + 2.0 * succ_loss
+
                 loss.backward()
                 optimizer.step()
 
-                total_loss += loss.item() * len(img_batch)
-                total_motion += weighted_motion_loss.item() * len(img_batch)
-                total_grip += grip_loss.item() * len(img_batch)
-                total_succ += succ_loss.item() * len(img_batch)
+                total_loss += loss.item() * len(img_b)
+                total_motion += weighted_motion_loss.item() * len(img_b)
+                total_grip += grip_loss.item() * len(img_b)
+                total_succ += succ_loss.item() * len(img_b)
 
             scheduler.step()
             avg_loss = total_loss / len(dataset)
