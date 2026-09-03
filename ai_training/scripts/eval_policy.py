@@ -97,14 +97,17 @@ def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, mod
     prompt_str = f"Instruction: \"{sim.instruction}\""
     screen.blit(font_bold.render(prompt_str, True, (255, 230, 120)), (35, 432))
 
-    # Display Model's Self-Evaluated Success Confidence
-    succ_color = (80, 255, 120) if model_succ_prob > 0.60 else (200, 200, 210)
-    conf_str = f"Task Confidence: {model_succ_prob*100:.1f}%"
-    screen.blit(font_bold.render(conf_str, True, succ_color), (35, 458))
+    # Real Physical Distance & Model Self-Belief
+    dist_to_goal = np.linalg.norm(sim.target_cube_pos[:2] - sim.target_platform_pos[:2])
+    dist_str = f"Dist to Goal: {dist_to_goal*100:.1f} cm | Model Belief: {model_succ_prob*100:.1f}%"
+    screen.blit(font.render(dist_str, True, (190, 195, 210)), (35, 458))
 
     if is_success:
-        succ_label = font_bold.render("[TASK COMPLETED: OBJECT PLACED!]", True, (80, 255, 120))
-        screen.blit(succ_label, (350, 458))
+        succ_label = font_bold.render("[TRUE PHYSICAL SUCCESS: PLACED!]", True, (80, 255, 120))
+        screen.blit(succ_label, (420, 458))
+    elif sim.grasped:
+        grasp_label = font.render("[OBJECT GRASPED -> TRANSPORTING]", True, (255, 210, 80))
+        screen.blit(grasp_label, (420, 458))
 
     info_str = font.render(f"EE: [{sim.ee_pos[0]:.2f}, {sim.ee_pos[1]:.2f}, {sim.ee_pos[2]:.2f}] | Clutter: {len(sim.distractor_cubes)} distractors | [ESC] Exit", True, (140, 145, 160))
     screen.blit(info_str, (35, 485))
@@ -217,7 +220,10 @@ def evaluate(episodes=10):
             ], dtype=np.float32)
 
             obs_dict, is_succ = sim.step_delta(full_delta, max_step=0.007)
-            if is_succ or model_succ_prob > 0.85:
+            
+            # STRICT PHYSICAL SUCCESS ONLY:
+            # The cube must be physically placed on the target platform and released
+            if is_succ:
                 ep_success = True
 
             norm_proprio = (obs_dict["proprio"] - proprio_mean) / proprio_std
@@ -235,14 +241,15 @@ def evaluate(episodes=10):
 
         if ep_success:
             successes += 1
-            print(f"Episode {ep}: SUCCESS! Picked correct target and placed on goal.")
+            print(f"Episode {ep}: SUCCESS! Physical cube placed on target platform.")
         else:
-            print(f"Episode {ep}: Failed.")
+            final_dist = np.linalg.norm(sim.target_cube_pos[:2] - sim.target_platform_pos[:2])
+            print(f"Episode {ep}: FAILED (Final dist to goal: {final_dist*100:.1f} cm)")
 
         time.sleep(0.3)
 
     print(f"\n==================================================")
-    print(f" Final Score: {successes} / {episodes} Successes ({(successes/episodes)*100:.1f}%)")
+    print(f" True Physical Score: {successes} / {episodes} Successes ({(successes/episodes)*100:.1f}%)")
     print(f"==================================================")
 
     pygame.quit()
