@@ -122,17 +122,14 @@ class SmolVLAMultimodalDataset(Dataset):
 
             ep_len = len(proprio_ep)
             for t in range(ep_len):
-                # 1. Current RGB camera frame [3, 64, 64]
                 img_t = imgs_ep[t]
 
-                # 2. Past proprioception sequence [T_obs=8, 5]
                 start_idx = max(0, t - window_size + 1)
                 window_proprio = norm_proprio_ep[start_idx : t + 1]
                 if len(window_proprio) < window_size:
                     pad = np.repeat(norm_proprio_ep[0:1], window_size - len(window_proprio), axis=0)
                     window_proprio = np.concatenate([pad, window_proprio], axis=0)
 
-                # 3. Future action trajectory chunk [H=8, 6]
                 end_idx = min(ep_len, t + chunk_size)
                 chunk_act = norm_act_ep[t:end_idx]
                 if len(chunk_act) < chunk_size:
@@ -171,10 +168,9 @@ class VisionPatchEncoder(nn.Module):
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, img):
-        # img: [B, 3, 64, 64]
-        x = self.conv(img) # [B, d_model, 4, 4]
+        x = self.conv(img)
         B, D, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2) # [B, 16, d_model]
+        x = x.flatten(2).transpose(1, 2)
         return self.norm(x)
 
 
@@ -201,15 +197,12 @@ class ActionExpertCrossAttentionBlock(nn.Module):
         )
 
     def forward(self, act_tokens, vlm_layer_feat):
-        # 1. Self-attention over action chunk tokens
         sa_out, _ = self.self_attn(act_tokens, act_tokens, act_tokens)
         act_tokens = self.norm1(act_tokens + sa_out)
 
-        # 2. Cross-attention over specific VLM layer features (SmolVLA Multi-Layer Fusion)
         ca_out, _ = self.cross_attn(query=act_tokens, key=vlm_layer_feat, value=vlm_layer_feat)
         act_tokens = self.norm2(act_tokens + ca_out)
 
-        # 3. Feed-forward
         ffn_out = self.ffn(act_tokens)
         act_tokens = self.norm3(act_tokens + ffn_out)
         return act_tokens
@@ -233,12 +226,10 @@ class SmolVLAPolicy(nn.Module):
         self.chunk_size = chunk_size
         self.d_model = d_model
 
-        # 1. Modality Encoders
         self.vision_encoder = VisionPatchEncoder(in_channels=3, d_model=d_model, patch_size=16)
         self.lang_embedding = nn.Embedding(vocab_size, d_model)
         self.proprio_proj = nn.Linear(5, d_model)
 
-        # 2. Multi-Modal Perception Transformer (SmolVLM-2 style)
         self.vlm_layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=d_model,
@@ -251,70 +242,58 @@ class SmolVLAPolicy(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # 3. Action Expert Transformer (SmolVLA Action Expert)
         self.action_queries = nn.Parameter(torch.randn(1, chunk_size, d_model) * 0.02)
         self.action_expert_layers = nn.ModuleList([
             ActionExpertCrossAttentionBlock(d_model=d_model, nhead=nhead, dim_feedforward=256)
             for _ in range(num_layers)
         ])
 
-        # 4. Multi-Layer Feature Fusion
         self.fusion_proj = nn.Linear(d_model * num_layers, d_model)
 
-        # 5. Output Heads
         self.motion_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
-            nn.Linear(d_model // 2, 4) # dx, dy, dz, dyaw
+            nn.Linear(d_model // 2, 4)
         )
 
         self.gripper_head = nn.Sequential(
             nn.Linear(d_model, d_model // 4),
             nn.GELU(),
-            nn.Linear(d_model // 4, 1) # Gripper logit
+            nn.Linear(d_model // 4, 1)
         )
 
         self.success_head = nn.Sequential(
             nn.Linear(d_model, d_model // 4),
             nn.GELU(),
-            nn.Linear(d_model // 4, 1) # Self-evaluated task completion
+            nn.Linear(d_model // 4, 1)
         )
 
     def forward(self, img, proprio_seq, prompt_tokens):
-        # img: [B, 3, 64, 64]
-        # proprio_seq: [B, T_obs=8, 5]
-        # prompt_tokens: [B, max_len=14]
         batch_size = img.size(0)
 
-        # Modality Token Projections
-        vis_tokens = self.vision_encoder(img)              # [B, 16, D]
-        lang_tokens = self.lang_embedding(prompt_tokens)   # [B, 14, D]
-        proprio_tokens = self.proprio_proj(proprio_seq)    # [B, 8, D]
+        vis_tokens = self.vision_encoder(img)
+        lang_tokens = self.lang_embedding(prompt_tokens)
+        proprio_tokens = self.proprio_proj(proprio_seq)
 
-        # Multi-Modal Prefix Sequence: [Language + Vision + Proprioception]
-        multimodal_seq = torch.cat([lang_tokens, vis_tokens, proprio_tokens], dim=1) # [B, 38, D]
+        multimodal_seq = torch.cat([lang_tokens, vis_tokens, proprio_tokens], dim=1)
 
-        # Step 1: Extract all layer outputs from SmolVLM-2 Perception Backbone
         vlm_all_layers = []
         h = multimodal_seq
         for layer in self.vlm_layers:
             h = layer(h)
             vlm_all_layers.append(h)
 
-        # Step 2: Action Expert queries cross-attend to each VLM layer
-        act_tokens = self.action_queries.expand(batch_size, -1, -1) # [B, H, D]
+        act_tokens = self.action_queries.expand(batch_size, -1, -1)
         for i, expert_block in enumerate(self.action_expert_layers):
             layer_feat = vlm_all_layers[i]
             act_tokens = expert_block(act_tokens, layer_feat)
 
-        # Step 3: Multi-Head Action Predictions
-        motion_chunk = self.motion_head(act_tokens)       # [B, H, 4]
-        grip_chunk_logits = self.gripper_head(act_tokens) # [B, H, 1]
+        motion_chunk = self.motion_head(act_tokens)
+        grip_chunk_logits = self.gripper_head(act_tokens)
 
-        # Success evaluated from fused VLM multimodal context
-        fused_vlm = torch.cat(vlm_all_layers, dim=-1) # [B, 38, D * num_layers]
-        global_context = self.fusion_proj(fused_vlm).mean(dim=1) # [B, D]
-        success_logit = self.success_head(global_context) # [B, 1]
+        fused_vlm = torch.cat(vlm_all_layers, dim=-1)
+        global_context = self.fusion_proj(fused_vlm).mean(dim=1)
+        success_logit = self.success_head(global_context)
 
         return motion_chunk, grip_chunk_logits, success_logit
 
@@ -359,48 +338,58 @@ def train(epochs=180, batch_size=128, lr=5e-4):
 
     print(f"\n>> Training SmolVLA Model on CPU across {len(dataset)} Action-Chunks ({epochs} epochs)...")
 
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total_loss = 0.0
-        total_motion = 0.0
-        total_grip = 0.0
-        total_succ = 0.0
+    best_loss = float('inf')
 
-        for img_batch, proprio_batch, prompt_batch, target_chunk in dataloader:
-            optimizer.zero_grad()
-            pred_motion_chunk, pred_grip_chunk, pred_succ = model(img_batch, proprio_batch, prompt_batch)
+    try:
+        for epoch in range(1, epochs + 1):
+            model.train()
+            total_loss = 0.0
+            total_motion = 0.0
+            total_grip = 0.0
+            total_succ = 0.0
 
-            target_motion = target_chunk[:, :, :4]
-            target_grip = target_chunk[:, :, 4:5]
-            target_succ = target_chunk[:, -1, 5:6]
+            for img_batch, proprio_batch, prompt_batch, target_chunk in dataloader:
+                optimizer.zero_grad()
+                pred_motion_chunk, pred_grip_chunk, pred_succ = model(img_batch, proprio_batch, prompt_batch)
 
-            # Weighted motion Huber loss across all chunk timesteps
-            raw_motion_loss = huber_loss_fn(pred_motion_chunk, target_motion) # [B, H, 4]
-            weighted_motion_loss = (raw_motion_loss * axis_weights).mean()
+                target_motion = target_chunk[:, :, :4]
+                target_grip = target_chunk[:, :, 4:5]
+                target_succ = target_chunk[:, -1, 5:6]
 
-            # Binary Cross Entropy for gripper across chunk
-            grip_loss = bce_loss_fn(pred_grip_chunk, target_grip)
-            
-            # Binary Cross Entropy for self-evaluated task success
-            succ_loss = bce_loss_fn(pred_succ, target_succ)
+                raw_motion_loss = huber_loss_fn(pred_motion_chunk, target_motion)
+                weighted_motion_loss = (raw_motion_loss * axis_weights).mean()
 
-            loss = weighted_motion_loss + 3.0 * grip_loss + 2.0 * succ_loss
-            loss.backward()
-            optimizer.step()
+                grip_loss = bce_loss_fn(pred_grip_chunk, target_grip)
+                succ_loss = bce_loss_fn(pred_succ, target_succ)
 
-            total_loss += loss.item() * len(img_batch)
-            total_motion += weighted_motion_loss.item() * len(img_batch)
-            total_grip += grip_loss.item() * len(img_batch)
-            total_succ += succ_loss.item() * len(img_batch)
+                loss = weighted_motion_loss + 3.0 * grip_loss + 2.0 * succ_loss
+                loss.backward()
+                optimizer.step()
 
-        scheduler.step()
-        avg_loss = total_loss / len(dataset)
-        avg_motion = total_motion / len(dataset)
-        avg_grip = total_grip / len(dataset)
-        avg_succ = total_succ / len(dataset)
+                total_loss += loss.item() * len(img_batch)
+                total_motion += weighted_motion_loss.item() * len(img_batch)
+                total_grip += grip_loss.item() * len(img_batch)
+                total_succ += succ_loss.item() * len(img_batch)
 
-        if epoch % 20 == 0 or epoch == 1 or epoch == epochs:
-            print(f"Epoch [{epoch:03d}/{epochs}] - Total: {avg_loss:.5f} | Motion: {avg_motion:.5f} | Grip: {avg_grip:.5f} | Succ: {avg_succ:.5f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+            scheduler.step()
+            avg_loss = total_loss / len(dataset)
+            avg_motion = total_motion / len(dataset)
+            avg_grip = total_grip / len(dataset)
+            avg_succ = total_succ / len(dataset)
+
+            # Checkpoint whenever loss improves or at every epoch milestone
+            if avg_loss < best_loss or epoch % 10 == 0:
+                best_loss = min(best_loss, avg_loss)
+                torch.save(model.state_dict(), model_path)
+
+            if epoch % 20 == 0 or epoch == 1 or epoch == epochs:
+                print(f"Epoch [{epoch:03d}/{epochs}] - Total: {avg_loss:.5f} | Motion: {avg_motion:.5f} | Grip: {avg_grip:.5f} | Succ: {avg_succ:.5f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+
+    except KeyboardInterrupt:
+        print("\n\n[INFO] Training interrupted by user! Saving current checkpoint...")
+        torch.save(model.state_dict(), model_path)
+        print(f"[SAVED] Checkpoint saved successfully before exiting -> {model_path}")
+        return
 
     torch.save(model.state_dict(), model_path)
     print(f"\n[SUCCESS] Multimodal SmolVLA Policy saved -> {model_path}")
