@@ -9,12 +9,11 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
 # -----------------------------------------------------------------------------
-# Hardware Acceleration & DirectML / GPU / oneDNN Multi-Threading Engine
+# Hardware Acceleration Setup
 # -----------------------------------------------------------------------------
 DEVICE = torch.device("cpu")
 USE_DIRECTML = False
 
-# 1. Try DirectML (Intel Iris Xe / AMD / DirectX 12 hardware acceleration)
 try:
     import torch_directml
     DEVICE = torch_directml.device()
@@ -23,20 +22,17 @@ try:
 except ImportError:
     pass
 
-# 2. Try PyTorch CUDA / ROCm if available
 if not USE_DIRECTML and torch.cuda.is_available():
     DEVICE = torch.device("cuda")
     print(f">> [HARDWARE ACCELERATION] CUDA device enabled: {torch.cuda.get_device_name(0)}")
 
-# 3. If on CPU, maximize oneDNN / MKL / OpenMP multithreading
 if DEVICE.type == "cpu":
     NUM_THREADS = min(8, os.cpu_count() or 4)
     torch.set_num_threads(NUM_THREADS)
     torch.set_num_interop_threads(NUM_THREADS)
-    # Enable oneDNN Graph & fast math
     if hasattr(torch.backends, 'mkldnn'):
         torch.backends.mkldnn.enabled = True
-    print(f">> [HARDWARE ACCELERATION] Intel MKL / oneDNN enabled ({NUM_THREADS} OpenMP threads).")
+    print(f">> [HARDWARE ACCELERATION] CPU multithreading enabled ({NUM_THREADS} threads).")
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "demos")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
@@ -67,9 +63,6 @@ def tokenize_prompt(prompt_text, max_len=MAX_PROMPT_LEN):
 # 2. High-Speed Pre-Tensorized Multimodal Dataset
 # -----------------------------------------------------------------------------
 class SmolVLAMultimodalDataset(Dataset):
-    """
-    High-Speed In-Memory Pre-Tensorized Dataset with pinned memory support
-    """
     def __init__(self, data_dir, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE):
         self.window_size = window_size
         self.chunk_size = chunk_size
@@ -97,7 +90,7 @@ class SmolVLAMultimodalDataset(Dataset):
                 imgs = np.zeros((N, 3, 64, 64), dtype=np.float32)
                 proprio = obs[:, :5]
 
-            act = data['actions']                   # [N, 6] (or [N, 5])
+            act = data['actions']                   # [N, 6]
             if act.shape[1] == 5:
                 succ_col = np.zeros((len(act), 1), dtype=np.float32)
                 act = np.concatenate([act, succ_col], axis=-1)
@@ -167,7 +160,6 @@ class SmolVLAMultimodalDataset(Dataset):
                 prompt_list.append(prompt_tok)
                 act_list.append(chunk_act)
 
-        # Pre-convert into contiguous PyTorch tensors
         self.imgs_tensor = torch.tensor(np.array(img_list, dtype=np.float32), dtype=torch.float32)
         self.proprio_tensor = torch.tensor(np.array(proprio_list, dtype=np.float32), dtype=torch.float32)
         self.prompt_tensor = torch.tensor(np.array(prompt_list, dtype=np.int64), dtype=torch.int64)
@@ -183,24 +175,50 @@ class SmolVLAMultimodalDataset(Dataset):
 
 
 # -----------------------------------------------------------------------------
-# 3. SmolVLM-2 Perception Backbone with Multi-Layer Extraction & Action Expert
+# 3. Spatial Coordinate-Aware Multi-Scale Visual Backbone (VLA Pretraining & Fine-Tuning)
 # -----------------------------------------------------------------------------
 
-class VisionPatchEncoder(nn.Module):
+class CoordConvPatchEncoder(nn.Module):
     """
-    Lightweight Vision Patch Tokenizer for SmolVLM-2:
-    Takes [B, 3, 64, 64] RGB Image -> Conv/Patch Projection -> [B, N_patches=16, d_model=128]
+    Spatial Coordinate-Aware Vision Backbone:
+    1. Injects explicit normalized 2D coordinate meshgrids (x, y) into raw RGB pixels [5, 64, 64].
+    2. Multi-scale feature extraction: Captures high-res color boundaries + spatial patches.
+    3. Learned 2D Spatial Positional Embeddings.
     """
-    def __init__(self, in_channels=3, d_model=128, patch_size=16):
+    def __init__(self, in_channels=5, d_model=128):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, d_model, kernel_size=patch_size, stride=patch_size)
+        # Conv backbone for sub-millimeter visual grounding
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), # -> [32, 32]
+            nn.GELU(),
+            nn.Conv2d(64, d_model, kernel_size=3, stride=2, padding=1), # -> [16, 16]
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((8, 8)) # 64 spatial visual tokens [B, D, 8, 8]
+        )
+        self.pos_embed = nn.Parameter(torch.randn(1, 64, d_model) * 0.02)
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, img):
-        x = self.conv(img)
-        B, D, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)
-        return self.norm(x)
+        # img: [B, 3, 64, 64]
+        B, C, H, W = img.shape
+        device = img.device
+
+        # Create Coordinate Meshgrid (Normalized -1 to +1)
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=device),
+            torch.linspace(-1, 1, W, device=device),
+            indexing='ij'
+        )
+        coord_grid = torch.stack([grid_x, grid_y], dim=0).unsqueeze(0).expand(B, -1, -1, -1) # [B, 2, 64, 64]
+        
+        # CoordConv input: [B, 5, 64, 64] (R, G, B, X_coord, Y_coord)
+        x_in = torch.cat([img, coord_grid], dim=1)
+        feat_map = self.stem(x_in) # [B, d_model, 8, 8]
+        tokens = feat_map.flatten(2).transpose(1, 2) # [B, 64, d_model]
+        tokens = self.norm(tokens + self.pos_embed)
+        return tokens
 
 
 class ActionExpertCrossAttentionBlock(nn.Module):
@@ -236,14 +254,14 @@ class ActionExpertCrossAttentionBlock(nn.Module):
 
 class SmolVLAPolicy(nn.Module):
     """
-    Complete SmolVLA / Pi0 Vision-Language-Action Policy
+    Complete SmolVLA / Pi0 Vision-Language-Action Policy with CoordConv & Multi-Layer VLM
     """
     def __init__(self, vocab_size=len(VOCAB), chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3):
         super().__init__()
         self.chunk_size = chunk_size
         self.d_model = d_model
 
-        self.vision_encoder = VisionPatchEncoder(in_channels=3, d_model=d_model, patch_size=16)
+        self.vision_encoder = CoordConvPatchEncoder(in_channels=5, d_model=d_model)
         self.lang_embedding = nn.Embedding(vocab_size, d_model)
         self.proprio_proj = nn.Linear(5, d_model)
 
@@ -288,11 +306,11 @@ class SmolVLAPolicy(nn.Module):
     def forward(self, img, proprio_seq, prompt_tokens):
         batch_size = img.size(0)
 
-        vis_tokens = self.vision_encoder(img)
-        lang_tokens = self.lang_embedding(prompt_tokens)
-        proprio_tokens = self.proprio_proj(proprio_seq)
+        vis_tokens = self.vision_encoder(img)              # [B, 64, D] (CoordConv + Visual tokens)
+        lang_tokens = self.lang_embedding(prompt_tokens)   # [B, 14, D]
+        proprio_tokens = self.proprio_proj(proprio_seq)    # [B, 8, D]
 
-        multimodal_seq = torch.cat([lang_tokens, vis_tokens, proprio_tokens], dim=1)
+        multimodal_seq = torch.cat([lang_tokens, vis_tokens, proprio_tokens], dim=1) # [B, 86, D]
 
         vlm_all_layers = []
         h = multimodal_seq
@@ -319,10 +337,10 @@ class SmolVLAPolicy(nn.Module):
 DobotActionChunkTransformer = SmolVLAPolicy
 
 
-def train(epochs=120, batch_size=256, lr=8e-4):
+def train(epochs=140, batch_size=256, lr=9e-4):
     print("=" * 68)
-    print("   SmolVLA / Pi0 High-Speed Multimodal Policy Training")
-    print(f"   (Device: {DEVICE.type.upper()} | Batch: {batch_size} | LR: {lr})")
+    print("   SmolVLA / Pi0 Multimodal Generalist Policy Training & Fine-Tuning")
+    print(f"   (CoordConv Multi-Scale Perception | Device: {DEVICE.type.upper()})")
     print("=" * 68)
 
     dataset = SmolVLAMultimodalDataset(DATA_DIR, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE)
@@ -348,11 +366,10 @@ def train(epochs=120, batch_size=256, lr=8e-4):
             elif len(compat) > 0:
                 model_dict.update(compat)
                 model.load_state_dict(model_dict)
-                print(f">> [WARM START] Loaded {len(compat)}/{len(model_dict)} layers.")
+                print(f">> [VLA FINE-TUNING] Transferred {len(compat)}/{len(model_dict)} pretrained backbone layers.")
         except Exception as e:
             print(f">> [INFO] Initializing fresh SmolVLA Transformer.")
 
-    # High-performance fused AdamW if available
     try:
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4, fused=True)
     except Exception:
@@ -364,7 +381,6 @@ def train(epochs=120, batch_size=256, lr=8e-4):
     bce_loss_fn = nn.BCEWithLogitsLoss()
     axis_weights = torch.tensor([1.0, 1.0, 4.0, 1.0], dtype=torch.float32, device=DEVICE)
 
-    # Enable mixed precision bfloat16 / float16 for CPU/GPU acceleration
     use_amp = True
     amp_dtype = torch.bfloat16 if (DEVICE.type == 'cpu' and hasattr(torch, 'bfloat16')) else torch.float32
 
@@ -388,7 +404,6 @@ def train(epochs=120, batch_size=256, lr=8e-4):
 
                 optimizer.zero_grad(set_to_none=True)
 
-                # Automatic Mixed Precision for 2x faster CPU/GPU tensor math
                 with torch.autocast(device_type=DEVICE.type, dtype=amp_dtype, enabled=use_amp):
                     pred_motion_chunk, pred_grip_chunk, pred_succ = model(img_b, proprio_b, prompt_b)
 
