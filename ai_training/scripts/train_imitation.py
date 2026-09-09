@@ -1,4 +1,5 @@
 import os
+import sys
 import glob
 import math
 import numpy as np
@@ -18,21 +19,21 @@ try:
     import torch_directml
     DEVICE = torch_directml.device()
     USE_DIRECTML = True
-    print(f">> [HARDWARE ACCELERATION] DirectML GPU device enabled: {DEVICE}")
+    print(f">> [HARDWARE ACCELERATION] DirectML GPU device enabled: {DEVICE}", flush=True)
 except ImportError:
     pass
 
 if not USE_DIRECTML and torch.cuda.is_available():
     DEVICE = torch.device("cuda")
-    print(f">> [HARDWARE ACCELERATION] CUDA device enabled: {torch.cuda.get_device_name(0)}")
+    print(f">> [HARDWARE ACCELERATION] CUDA device enabled: {torch.cuda.get_device_name(0)}", flush=True)
 
 if DEVICE.type == "cpu":
-    NUM_THREADS = min(8, os.cpu_count() or 4)
+    NUM_THREADS = min(4, os.cpu_count() or 4)
     torch.set_num_threads(NUM_THREADS)
     torch.set_num_interop_threads(NUM_THREADS)
     if hasattr(torch.backends, 'mkldnn'):
         torch.backends.mkldnn.enabled = True
-    print(f">> [HARDWARE ACCELERATION] CPU multithreading enabled ({NUM_THREADS} threads).")
+    print(f">> [HARDWARE ACCELERATION] CPU multithreading enabled ({NUM_THREADS} threads).", flush=True)
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "demos")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
@@ -60,9 +61,13 @@ def tokenize_prompt(prompt_text, max_len=MAX_PROMPT_LEN):
     return np.array(indices, dtype=np.int64)
 
 # -----------------------------------------------------------------------------
-# 2. High-Speed Pre-Tensorized Multimodal Dataset
+# 2. Memory-Safe Lightweight Multimodal Dataset
 # -----------------------------------------------------------------------------
 class SmolVLAMultimodalDataset(Dataset):
+    """
+    Memory-efficient index-based dataset:
+    Keeps episode arrays intact in RAM without duplicating 46,000 full-resolution tensors.
+    """
     def __init__(self, data_dir, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE):
         self.window_size = window_size
         self.chunk_size = chunk_size
@@ -70,40 +75,47 @@ class SmolVLAMultimodalDataset(Dataset):
         if not files:
             raise ValueError(f"No demonstration files found in {data_dir}. Generate demos first!")
 
-        episodes_img = []
-        episodes_proprio = []
-        episodes_act = []
-        episodes_prompt = []
+        self.episodes_img = []
+        self.episodes_proprio = []
+        self.episodes_act = []
+        self.episodes_prompt = []
+        self.indices = [] # list of (ep_idx, step_idx)
 
         all_proprio_flat = []
         all_motion_flat = []
 
-        for f in files:
+        print(f">> Loading {len(files)} demonstration files into memory...", flush=True)
+
+        for ep_idx, f in enumerate(files):
             data = np.load(f, allow_pickle=True)
             
             if 'images' in data and 'proprioception' in data:
-                imgs = data['images']               # [N, 3, 64, 64]
-                proprio = data['proprioception']    # [N, 5]
+                imgs = data['images'].astype(np.float32)               # [N, 3, 64, 64]
+                proprio = data['proprioception'].astype(np.float32)    # [N, 5]
             else:
-                obs = data['observations']
+                obs = data['observations'].astype(np.float32)
                 N = len(obs)
                 imgs = np.zeros((N, 3, 64, 64), dtype=np.float32)
                 proprio = obs[:, :5]
 
-            act = data['actions']                   # [N, 6]
+            act = data['actions'].astype(np.float32)                   # [N, 6]
             if act.shape[1] == 5:
                 succ_col = np.zeros((len(act), 1), dtype=np.float32)
                 act = np.concatenate([act, succ_col], axis=-1)
 
             prompt_str = str(data['prompt'][0]) if 'prompt' in data else "pick up the red cube and place it on the green platform"
+            prompt_tok = tokenize_prompt(prompt_str)
 
-            episodes_img.append(imgs)
-            episodes_proprio.append(proprio)
-            episodes_act.append(act)
-            episodes_prompt.append(tokenize_prompt(prompt_str))
+            self.episodes_img.append(imgs)
+            self.episodes_proprio.append(proprio)
+            self.episodes_act.append(act)
+            self.episodes_prompt.append(prompt_tok)
 
             all_proprio_flat.append(proprio)
             all_motion_flat.append(act[:, :4])
+
+            for t in range(len(proprio)):
+                self.indices.append((ep_idx, t))
 
         all_proprio_concat = np.concatenate(all_proprio_flat, axis=0)
         all_motion_concat = np.concatenate(all_motion_flat, axis=0)
@@ -124,54 +136,49 @@ class SmolVLAMultimodalDataset(Dataset):
             window_size=self.window_size,
             chunk_size=self.chunk_size
         )
-        print(f"Saved SmolVLA normalization statistics -> {stats_path}")
+        print(f"Saved SmolVLA normalization statistics -> {stats_path}", flush=True)
 
-        img_list = []
-        proprio_list = []
-        prompt_list = []
-        act_list = []
+        # Normalize in-place to save memory
+        for ep_idx in range(len(self.episodes_proprio)):
+            self.episodes_proprio[ep_idx] = (self.episodes_proprio[ep_idx] - self.proprio_mean) / self.proprio_std
+            norm_motion = (self.episodes_act[ep_idx][:, :4] - self.motion_mean) / self.motion_std
+            self.episodes_act[ep_idx][:, :4] = norm_motion
 
-        for imgs_ep, proprio_ep, act_ep, prompt_tok in zip(episodes_img, episodes_proprio, episodes_act, episodes_prompt):
-            norm_proprio_ep = (proprio_ep - self.proprio_mean) / self.proprio_std
-            
-            motion_ep = act_ep[:, :4]
-            discrete_ep = act_ep[:, 4:6]
-            norm_motion_ep = (motion_ep - self.motion_mean) / self.motion_std
-            norm_act_ep = np.concatenate([norm_motion_ep, discrete_ep], axis=-1)
-
-            ep_len = len(proprio_ep)
-            for t in range(ep_len):
-                img_t = imgs_ep[t]
-
-                start_idx = max(0, t - window_size + 1)
-                window_proprio = norm_proprio_ep[start_idx : t + 1]
-                if len(window_proprio) < window_size:
-                    pad = np.repeat(norm_proprio_ep[0:1], window_size - len(window_proprio), axis=0)
-                    window_proprio = np.concatenate([pad, window_proprio], axis=0)
-
-                end_idx = min(ep_len, t + chunk_size)
-                chunk_act = norm_act_ep[t:end_idx]
-                if len(chunk_act) < chunk_size:
-                    pad_act = np.repeat(norm_act_ep[-1:], chunk_size - len(chunk_act), axis=0)
-                    chunk_act = np.concatenate([chunk_act, pad_act], axis=0)
-
-                img_list.append(img_t)
-                proprio_list.append(window_proprio)
-                prompt_list.append(prompt_tok)
-                act_list.append(chunk_act)
-
-        self.imgs_tensor = torch.tensor(np.array(img_list, dtype=np.float32), dtype=torch.float32)
-        self.proprio_tensor = torch.tensor(np.array(proprio_list, dtype=np.float32), dtype=torch.float32)
-        self.prompt_tensor = torch.tensor(np.array(prompt_list, dtype=np.int64), dtype=torch.int64)
-        self.acts_tensor = torch.tensor(np.array(act_list, dtype=np.float32), dtype=torch.float32)
-
-        print(f"Loaded {len(files)} episodes -> {len(self.imgs_tensor)} Multimodal SmolVLA samples into RAM.")
+        print(f">> Successfully indexed {len(self.indices)} SmolVLA samples from {len(files)} demonstrations.", flush=True)
 
     def __len__(self):
-        return len(self.imgs_tensor)
+        return len(self.indices)
 
     def __getitem__(self, idx):
-        return self.imgs_tensor[idx], self.proprio_tensor[idx], self.prompt_tensor[idx], self.acts_tensor[idx]
+        ep_idx, t = self.indices[idx]
+        imgs = self.episodes_img[ep_idx]
+        proprio = self.episodes_proprio[ep_idx]
+        acts = self.episodes_act[ep_idx]
+        prompt = self.episodes_prompt[ep_idx]
+
+        ep_len = len(proprio)
+        img_t = imgs[t]
+
+        # Past proprioception window [T_obs=8, 5]
+        start_idx = max(0, t - self.window_size + 1)
+        window_proprio = proprio[start_idx : t + 1]
+        if len(window_proprio) < self.window_size:
+            pad = np.repeat(proprio[0:1], self.window_size - len(window_proprio), axis=0)
+            window_proprio = np.concatenate([pad, window_proprio], axis=0)
+
+        # Future action chunk [H_action=8, 6]
+        end_idx = min(ep_len, t + self.chunk_size)
+        chunk_act = acts[t:end_idx]
+        if len(chunk_act) < self.chunk_size:
+            pad_act = np.repeat(acts[-1:], self.chunk_size - len(chunk_act), axis=0)
+            chunk_act = np.concatenate([chunk_act, pad_act], axis=0)
+
+        return (
+            torch.tensor(img_t, dtype=torch.float32),
+            torch.tensor(window_proprio, dtype=torch.float32),
+            torch.tensor(prompt, dtype=torch.int64),
+            torch.tensor(chunk_act, dtype=torch.float32)
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -179,11 +186,6 @@ class SmolVLAMultimodalDataset(Dataset):
 # -----------------------------------------------------------------------------
 
 class CoordConvPatchEncoder(nn.Module):
-    """
-    High-Precision Spatial Coordinate-Aware Visual Encoder:
-    Injects normalized (x, y) coordinate grids into raw RGB pixels [5, 64, 64].
-    Outputs 64 spatial visual tokens [B, 64, d_model].
-    """
     def __init__(self, in_channels=5, d_model=128):
         super().__init__()
         self.stem = nn.Sequential(
@@ -220,11 +222,6 @@ class CoordConvPatchEncoder(nn.Module):
 
 
 class GroundedVisionLanguageFusion(nn.Module):
-    """
-    Vision-Language Grounding Module:
-    Uses Cross-Attention to query visual spatial tokens with the target instruction words.
-    Distractor objects of non-matching colors are strongly attenuated from the visual map.
-    """
     def __init__(self, d_model=128, nhead=4):
         super().__init__()
         self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=0.05, batch_first=True)
@@ -237,8 +234,6 @@ class GroundedVisionLanguageFusion(nn.Module):
         )
 
     def forward(self, vis_tokens, lang_tokens):
-        # vis_tokens: [B, 64, D], lang_tokens: [B, 14, D]
-        # Query: Visual tokens, Key/Value: Language instruction tokens
         attn_out, _ = self.cross_attn(query=vis_tokens, key=lang_tokens, value=lang_tokens)
         vis_grounded = self.norm_vis(vis_tokens + attn_out)
         out = self.norm_out(vis_grounded + self.mlp(vis_grounded))
@@ -246,12 +241,6 @@ class GroundedVisionLanguageFusion(nn.Module):
 
 
 class ActionExpertCrossAttentionBlock(nn.Module):
-    """
-    Action Expert Transformer Block (SmolVLA / Pi0):
-    - Causal Self-Attention across future action trajectory tokens
-    - Cross-Attention over grounded multimodal layer representations
-    - Trajectory MLP
-    """
     def __init__(self, d_model=128, nhead=4, dim_feedforward=256):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=0.05, batch_first=True)
@@ -280,14 +269,6 @@ class ActionExpertCrossAttentionBlock(nn.Module):
 
 
 class SmolVLAPolicy(nn.Module):
-    """
-    Complete Grounded SmolVLA / Pi0 Vision-Language-Action Policy:
-    1. CoordConv Spatial Vision: [3, 64, 64] -> [B, 64, D]
-    2. Semantic Language Embedding: [B, 14, D]
-    3. Vision-Language Grounding Cross-Attention: Filters out visual distractors
-    4. Multi-Layer SmolVLM-2 Perception Transformer
-    5. Action Expert Cross-Attention Trajectory Generation
-    """
     def __init__(self, vocab_size=len(VOCAB), chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3):
         super().__init__()
         self.chunk_size = chunk_size
@@ -339,28 +320,22 @@ class SmolVLAPolicy(nn.Module):
     def forward(self, img, proprio_seq, prompt_tokens):
         batch_size = img.size(0)
 
-        # 1. Modality Token Projections
         vis_tokens = self.vision_encoder(img)              # [B, 64, D] (CoordConv + Visual tokens)
         lang_tokens = self.lang_embedding(prompt_tokens)   # [B, 14, D]
         proprio_tokens = self.proprio_proj(proprio_seq)    # [B, 8, D]
 
-        # 2. Direct Language-to-Vision Grounding (Attenuates Distractor Patches)
         grounded_vis = self.vl_grounding(vis_tokens, lang_tokens) # [B, 64, D]
 
-        # 3. Multimodal Prefix Sequence
         multimodal_seq = torch.cat([lang_tokens, grounded_vis, proprio_tokens], dim=1) # [B, 86, D]
 
-        # 4. Multi-Layer Perception Transformer
         vlm_all_layers = []
         h = multimodal_seq
         for layer in self.vlm_layers:
             h = layer(h)
             vlm_all_layers.append(h)
 
-        # 5. Action Expert trajectory generation conditioned on grounded context
         act_tokens = self.action_queries.expand(batch_size, -1, -1)
-        # Condition initial queries on prompt summary
-        lang_summary = lang_tokens.mean(dim=1, keepdim=True) # [B, 1, D]
+        lang_summary = lang_tokens.mean(dim=1, keepdim=True)
         act_tokens = act_tokens + lang_summary
 
         for i, expert_block in enumerate(self.action_expert_layers):
@@ -381,18 +356,19 @@ class SmolVLAPolicy(nn.Module):
 DobotActionChunkTransformer = SmolVLAPolicy
 
 
-def train(epochs=160, batch_size=256, lr=1e-3):
-    print("=" * 68)
-    print("   Grounded SmolVLA / Pi0 Multimodal Policy Training")
-    print(f"   (Vision-Language Grounding Cross-Attention | Clutter Rejection)")
-    print("=" * 68)
+def train(epochs=120, batch_size=128, lr=1e-3):
+    print("=" * 68, flush=True)
+    print("   Grounded SmolVLA / Pi0 Multimodal Policy Training", flush=True)
+    print(f"   (Vision-Language Grounding Cross-Attention | Clutter Rejection)", flush=True)
+    print("=" * 68, flush=True)
 
     dataset = SmolVLAMultimodalDataset(DATA_DIR, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        drop_last=False
+        drop_last=False,
+        num_workers=0
     )
 
     model = SmolVLAPolicy(vocab_size=len(VOCAB), chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3)
@@ -406,13 +382,13 @@ def train(epochs=160, batch_size=256, lr=1e-3):
             compat = {k: v for k, v in ckpt.items() if k in model_dict and model_dict[k].shape == v.shape}
             if len(compat) == len(model_dict):
                 model.load_state_dict(compat)
-                print(f">> [RESUME] Loaded 100% SmolVLA weights from: {os.path.basename(model_path)}")
+                print(f">> [RESUME] Loaded 100% SmolVLA weights from: {os.path.basename(model_path)}", flush=True)
             elif len(compat) > 0:
                 model_dict.update(compat)
                 model.load_state_dict(model_dict)
-                print(f">> [VLA WARM START] Transferred {len(compat)}/{len(model_dict)} layers.")
+                print(f">> [VLA WARM START] Transferred {len(compat)}/{len(model_dict)} layers.", flush=True)
         except Exception as e:
-            print(f">> [INFO] Initializing fresh SmolVLA Transformer.")
+            print(f">> [INFO] Initializing fresh SmolVLA Transformer.", flush=True)
 
     try:
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4, fused=True)
@@ -428,7 +404,7 @@ def train(epochs=160, batch_size=256, lr=1e-3):
     use_amp = True
     amp_dtype = torch.bfloat16 if (DEVICE.type == 'cpu' and hasattr(torch, 'bfloat16')) else torch.float32
 
-    print(f"\n>> Training Grounded VLA across {len(dataset)} samples ({epochs} epochs with AMP)...")
+    print(f"\n>> Training Grounded VLA across {len(dataset)} samples ({epochs} epochs with AMP)...", flush=True)
 
     best_loss = float('inf')
 
@@ -482,16 +458,16 @@ def train(epochs=160, batch_size=256, lr=1e-3):
                 torch.save(model.state_dict(), model_path)
 
             if epoch % 10 == 0 or epoch == 1 or epoch == epochs:
-                print(f"Epoch [{epoch:03d}/{epochs}] - Total: {avg_loss:.5f} | Motion: {avg_motion:.5f} | Grip: {avg_grip:.5f} | Succ: {avg_succ:.5f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+                print(f"Epoch [{epoch:03d}/{epochs}] - Total: {avg_loss:.5f} | Motion: {avg_motion:.5f} | Grip: {avg_grip:.5f} | Succ: {avg_succ:.5f} | LR: {scheduler.get_last_lr()[0]:.6f}", flush=True)
 
     except KeyboardInterrupt:
-        print("\n\n[INFO] Training interrupted by user! Saving current checkpoint...")
+        print("\n\n[INFO] Training interrupted by user! Saving current checkpoint...", flush=True)
         torch.save(model.state_dict(), model_path)
-        print(f"[SAVED] Checkpoint saved successfully before exiting -> {model_path}")
+        print(f"[SAVED] Checkpoint saved successfully before exiting -> {model_path}", flush=True)
         return
 
     torch.save(model.state_dict(), model_path)
-    print(f"\n[SUCCESS] Grounded SmolVLA Policy saved -> {model_path}")
+    print(f"\n[SUCCESS] Grounded SmolVLA Policy saved -> {model_path}", flush=True)
 
 if __name__ == "__main__":
     train()
