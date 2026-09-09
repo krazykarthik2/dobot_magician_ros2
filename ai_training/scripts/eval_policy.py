@@ -85,41 +85,8 @@ def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, mod
         cam_tag = font.render("RGB Cam", True, (100, 220, 255))
         screen.blit(cam_tag, (290, 272))
 
-    # Neural Spatial Softmax Latent Token Space Visualizer (HUD Inset)
-    if latent_tokens is not None:
-        # Draw Latent Token Space Box
-        pygame.draw.rect(screen, (20, 22, 28), (410, 240, 340, 130), border_radius=6)
-        pygame.draw.rect(screen, (130, 90, 240), (410, 240, 340, 130), 2, border_radius=6)
-        
-        token_title = font_bold.render("SmolVLA-2 Internal Latent Token Space (Z_attn)", True, (200, 160, 255))
-        screen.blit(token_title, (420, 248))
-        
-        # Display Latent Token Coordinates
-        k = latent_tokens
-        cube_token_str = f"Target Obj Token  (z1, z2): [{k[0]:+.4f}, {k[1]:+.4f}]"
-        plat_token_str = f"Target Plat Token (z3, z4): [{k[2]:+.4f}, {k[3]:+.4f}]"
-        screen.blit(font.render(cube_token_str, True, (255, 200, 120)), (420, 272))
-        screen.blit(font.render(plat_token_str, True, (120, 255, 200)), (420, 294))
-
-        # Mini Latent Attention Grid Map
-        grid_x, grid_y = 670, 275
-        pygame.draw.rect(screen, (40, 44, 56), (grid_x, grid_y, 60, 60), border_radius=4)
-        pygame.draw.line(screen, (70, 75, 90), (grid_x + 30, grid_y), (grid_x + 30, grid_y + 60), 1)
-        pygame.draw.line(screen, (70, 75, 90), (grid_x, grid_y + 30), (grid_x + 60, grid_y + 30), 1)
-        
-        # Plot attention centroids
-        cx_dot = int(grid_x + 30 + k[0] * 26)
-        cy_dot = int(grid_y + 30 + k[1] * 26)
-        px_dot = int(grid_x + 30 + k[2] * 26)
-        py_dot = int(grid_y + 30 + k[3] * 26)
-        pygame.draw.circle(screen, (255, 80, 80), (cx_dot, cy_dot), 4) # Cube focus
-        pygame.draw.circle(screen, (80, 255, 120), (px_dot, py_dot), 4) # Plat focus
-        
-        status_note = font.render("Neural Spatial Attn Activations", True, (160, 165, 180))
-        screen.blit(status_note, (420, 340))
-
-    # Bottom Status HUD
-    pygame.draw.rect(screen, (30, 33, 42), (20, 395, 740, 115), border_radius=8)
+    # Bottom Status HUD (Top half of bottom area)
+    pygame.draw.rect(screen, (30, 33, 42), (20, 395, 740, 100), border_radius=8)
     
     title_str = f"SmolVLA-2 Neural Policy Evaluator: Episode {ep} / {total_eps}"
     screen.blit(font_bold.render(title_str, True, (100, 210, 255)), (35, 405))
@@ -128,22 +95,58 @@ def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, mod
     screen.blit(font.render(steps_str, True, (200, 200, 210)), (580, 408))
 
     prompt_str = f"Instruction: \"{sim.instruction}\""
-    screen.blit(font_bold.render(prompt_str, True, (255, 230, 120)), (35, 432))
+    screen.blit(font_bold.render(prompt_str, True, (255, 230, 120)), (35, 430))
 
-    # Real Physical Distance & Model Self-Belief
     dist_to_goal = np.linalg.norm(sim.target_cube_pos[:2] - sim.target_platform_pos[:2])
     dist_str = f"Dist to Goal: {dist_to_goal*100:.1f} cm | Neural Trajectory Horizon: 128 steps"
-    screen.blit(font.render(dist_str, True, (190, 195, 210)), (35, 458))
+    screen.blit(font.render(dist_str, True, (190, 195, 210)), (35, 455))
 
     if is_success:
         succ_label = font_bold.render("[TRUE PHYSICAL SUCCESS: PLACED!]", True, (80, 255, 120))
-        screen.blit(succ_label, (420, 458))
+        screen.blit(succ_label, (430, 455))
     elif sim.grasped:
         grasp_label = font.render("[OBJECT GRASPED -> TRANSPORTING]", True, (255, 210, 80))
-        screen.blit(grasp_label, (420, 458))
+        screen.blit(grasp_label, (430, 455))
 
     info_str = font.render(f"EE: [{sim.ee_pos[0]:.2f}, {sim.ee_pos[1]:.2f}, {sim.ee_pos[2]:.2f}] | Clutter: {len(sim.distractor_cubes)} distractors | [ESC] Exit", True, (140, 145, 160))
-    screen.blit(info_str, (35, 485))
+    screen.blit(info_str, (35, 475))
+
+    # Neural Spatial Softmax Latent Token Space Visualizer (Dedicated Bottom Panel)
+    if latent_tokens is not None:
+        pygame.draw.rect(screen, (20, 22, 28), (20, 505, 740, 105), border_radius=8)
+        pygame.draw.rect(screen, (130, 90, 240), (20, 505, 740, 105), 2, border_radius=8)
+        
+        token_title = font_bold.render("SmolVLA-2 Internal Latent Token Space (Z_attn)", True, (200, 160, 255))
+        screen.blit(token_title, (35, 515))
+        
+        k = latent_tokens
+        cube_token_str = f"Target Obj Token  (z1, z2): [{k[0]:+.4f}, {k[1]:+.4f}]"
+        plat_token_str = f"Target Plat Token (z3, z4): [{k[2]:+.4f}, {k[3]:+.4f}]"
+        screen.blit(font.render(cube_token_str, True, (255, 200, 120)), (35, 540))
+        screen.blit(font.render(plat_token_str, True, (120, 255, 200)), (35, 562))
+
+        status_note = font.render("Neural Spatial Attn Activations (Norm Coord: [-1, +1])", True, (160, 165, 180))
+        screen.blit(status_note, (35, 584))
+
+        # Mini Latent Attention Grid Map (Right side of bottom panel)
+        grid_x, grid_y = 660, 515
+        pygame.draw.rect(screen, (35, 38, 50), (grid_x, grid_y, 80, 80), border_radius=6)
+        pygame.draw.line(screen, (65, 70, 85), (grid_x + 40, grid_y), (grid_x + 40, grid_y + 80), 1)
+        pygame.draw.line(screen, (65, 70, 85), (grid_x, grid_y + 40), (grid_x + 80, grid_y + 40), 1)
+        
+        # Plot attention centroids
+        cx_dot = int(grid_x + 40 + k[0] * 34)
+        cy_dot = int(grid_y + 40 + k[1] * 34)
+        px_dot = int(grid_x + 40 + k[2] * 34)
+        py_dot = int(grid_y + 40 + k[3] * 34)
+        pygame.draw.circle(screen, (255, 80, 80), (cx_dot, cy_dot), 5) # Cube focus
+        pygame.draw.circle(screen, (80, 255, 120), (px_dot, py_dot), 5) # Plat focus
+        
+        # Legend
+        l_obj = font.render("Obj", True, (255, 80, 80))
+        l_plt = font.render("Plat", True, (80, 255, 120))
+        screen.blit(l_obj, (595, 535))
+        screen.blit(l_plt, (595, 560))
 
     pygame.display.flip()
 
@@ -160,7 +163,7 @@ def evaluate(episodes=10):
     sim = DobotPickPlaceSim()
 
     pygame.init()
-    screen = pygame.display.set_mode((780, 520))
+    screen = pygame.display.set_mode((780, 625))
     pygame.display.set_caption("SmolVLA-2 Neural Policy & Latent Space Visualizer")
     font = pygame.font.SysFont("Arial", 14)
     font_bold = pygame.font.SysFont("Arial", 16, bold=True)
