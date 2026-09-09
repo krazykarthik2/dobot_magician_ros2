@@ -175,56 +175,28 @@ class SmolVLAMultimodalDataset(Dataset):
 
 
 # -----------------------------------------------------------------------------
-# 3. Pretrained Hugging Face BERT Transformer Language Backbone
+# 3. Grounded Multi-Scale Visual-Language Backbone with CoordConv
 # -----------------------------------------------------------------------------
-
-def load_pretrained_hf_bert(d_model=128):
-    """
-    Loads pretrained Hugging Face BERT-Tiny weights for language grounding.
-    """
-    try:
-        from transformers import BertConfig, BertModel
-        cfg = BertConfig(
-            vocab_size=30522,
-            hidden_size=d_model,
-            num_hidden_layers=2,
-            num_attention_heads=2,
-            intermediate_size=512,
-            hidden_dropout_prob=0.05,
-            attention_probs_dropout_prob=0.05
-        )
-        bert_model = BertModel(cfg)
-
-        cache_dir = '/home/karthikkrazy/.cache/huggingface/hub/models--prajjwal1--bert-tiny/snapshots/6f75de8b60a9f8a2fdf7b69cbd86d9e64bcb3837'
-        bin_file = os.path.join(cache_dir, 'pytorch_model.bin')
-        if os.path.exists(bin_file):
-            state = torch.load(bin_file, map_location='cpu')
-            bert_state = {k[5:]: v for k, v in state.items() if k.startswith('bert.')}
-            bert_model.load_state_dict(bert_state, strict=False)
-            print(">> [PRETRAINED VLA] Successfully loaded Pretrained Hugging Face BERT Language Backbone!")
-        return bert_model
-    except Exception as e:
-        print(f">> [INFO] Fallback standard transformer language encoder: {e}")
-        return None
-
 
 class CoordConvPatchEncoder(nn.Module):
     """
-    Spatial Coordinate-Aware Vision Backbone:
-    1. Injects normalized 2D coordinate meshgrids (x, y) into raw RGB pixels [5, 64, 64].
-    2. Multi-scale feature extraction: Captures color boundaries + spatial locations.
-    3. Learned 2D Spatial Positional Embeddings (64 visual tokens).
+    High-Precision Spatial Coordinate-Aware Visual Encoder:
+    Injects normalized (x, y) coordinate grids into raw RGB pixels [5, 64, 64].
+    Outputs 64 spatial visual tokens [B, 64, d_model].
     """
     def __init__(self, in_channels=5, d_model=128):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
             nn.GELU(),
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), # -> [32, 32]
+            nn.BatchNorm2d(64),
             nn.GELU(),
             nn.Conv2d(64, d_model, kernel_size=3, stride=2, padding=1), # -> [16, 16]
+            nn.BatchNorm2d(d_model),
             nn.GELU(),
-            nn.AdaptiveAvgPool2d((8, 8)) # 64 spatial visual tokens [B, D, 8, 8]
+            nn.AdaptiveAvgPool2d((8, 8)) # 64 spatial tokens [B, D, 8, 8]
         )
         self.pos_embed = nn.Parameter(torch.randn(1, 64, d_model) * 0.02)
         self.norm = nn.LayerNorm(d_model)
@@ -247,9 +219,38 @@ class CoordConvPatchEncoder(nn.Module):
         return tokens
 
 
+class GroundedVisionLanguageFusion(nn.Module):
+    """
+    Vision-Language Grounding Module:
+    Uses Cross-Attention to query visual spatial tokens with the target instruction words.
+    Distractor objects of non-matching colors are strongly attenuated from the visual map.
+    """
+    def __init__(self, d_model=128, nhead=4):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=0.05, batch_first=True)
+        self.norm_vis = nn.LayerNorm(d_model)
+        self.norm_out = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, d_model)
+        )
+
+    def forward(self, vis_tokens, lang_tokens):
+        # vis_tokens: [B, 64, D], lang_tokens: [B, 14, D]
+        # Query: Visual tokens, Key/Value: Language instruction tokens
+        attn_out, _ = self.cross_attn(query=vis_tokens, key=lang_tokens, value=lang_tokens)
+        vis_grounded = self.norm_vis(vis_tokens + attn_out)
+        out = self.norm_out(vis_grounded + self.mlp(vis_grounded))
+        return out
+
+
 class ActionExpertCrossAttentionBlock(nn.Module):
     """
-    Action Expert Transformer Block (SmolVLA / Pi0)
+    Action Expert Transformer Block (SmolVLA / Pi0):
+    - Causal Self-Attention across future action trajectory tokens
+    - Cross-Attention over grounded multimodal layer representations
+    - Trajectory MLP
     """
     def __init__(self, d_model=128, nhead=4, dim_feedforward=256):
         super().__init__()
@@ -280,7 +281,12 @@ class ActionExpertCrossAttentionBlock(nn.Module):
 
 class SmolVLAPolicy(nn.Module):
     """
-    Complete SmolVLA / Pi0 Vision-Language-Action Policy with Pretrained Language Backbone & CoordConv
+    Complete Grounded SmolVLA / Pi0 Vision-Language-Action Policy:
+    1. CoordConv Spatial Vision: [3, 64, 64] -> [B, 64, D]
+    2. Semantic Language Embedding: [B, 14, D]
+    3. Vision-Language Grounding Cross-Attention: Filters out visual distractors
+    4. Multi-Layer SmolVLM-2 Perception Transformer
+    5. Action Expert Cross-Attention Trajectory Generation
     """
     def __init__(self, vocab_size=len(VOCAB), chunk_size=CHUNK_SIZE, d_model=128, nhead=4, num_layers=3):
         super().__init__()
@@ -289,7 +295,7 @@ class SmolVLAPolicy(nn.Module):
 
         self.vision_encoder = CoordConvPatchEncoder(in_channels=5, d_model=d_model)
         self.lang_embedding = nn.Embedding(vocab_size, d_model)
-        self.pretrained_hf_bert = load_pretrained_hf_bert(d_model=d_model)
+        self.vl_grounding = GroundedVisionLanguageFusion(d_model=d_model, nhead=nhead)
         self.proprio_proj = nn.Linear(5, d_model)
 
         self.vlm_layers = nn.ModuleList([
@@ -333,19 +339,30 @@ class SmolVLAPolicy(nn.Module):
     def forward(self, img, proprio_seq, prompt_tokens):
         batch_size = img.size(0)
 
+        # 1. Modality Token Projections
         vis_tokens = self.vision_encoder(img)              # [B, 64, D] (CoordConv + Visual tokens)
         lang_tokens = self.lang_embedding(prompt_tokens)   # [B, 14, D]
         proprio_tokens = self.proprio_proj(proprio_seq)    # [B, 8, D]
 
-        multimodal_seq = torch.cat([lang_tokens, vis_tokens, proprio_tokens], dim=1) # [B, 86, D]
+        # 2. Direct Language-to-Vision Grounding (Attenuates Distractor Patches)
+        grounded_vis = self.vl_grounding(vis_tokens, lang_tokens) # [B, 64, D]
 
+        # 3. Multimodal Prefix Sequence
+        multimodal_seq = torch.cat([lang_tokens, grounded_vis, proprio_tokens], dim=1) # [B, 86, D]
+
+        # 4. Multi-Layer Perception Transformer
         vlm_all_layers = []
         h = multimodal_seq
         for layer in self.vlm_layers:
             h = layer(h)
             vlm_all_layers.append(h)
 
+        # 5. Action Expert trajectory generation conditioned on grounded context
         act_tokens = self.action_queries.expand(batch_size, -1, -1)
+        # Condition initial queries on prompt summary
+        lang_summary = lang_tokens.mean(dim=1, keepdim=True) # [B, 1, D]
+        act_tokens = act_tokens + lang_summary
+
         for i, expert_block in enumerate(self.action_expert_layers):
             layer_feat = vlm_all_layers[i]
             act_tokens = expert_block(act_tokens, layer_feat)
@@ -364,10 +381,10 @@ class SmolVLAPolicy(nn.Module):
 DobotActionChunkTransformer = SmolVLAPolicy
 
 
-def train(epochs=140, batch_size=256, lr=9e-4):
+def train(epochs=160, batch_size=256, lr=1e-3):
     print("=" * 68)
-    print("   SmolVLA / Pi0 Multimodal Generalist Policy Fine-Tuning")
-    print(f"   (Pretrained HF Backbone + CoordConv Multi-Scale Perception)")
+    print("   Grounded SmolVLA / Pi0 Multimodal Policy Training")
+    print(f"   (Vision-Language Grounding Cross-Attention | Clutter Rejection)")
     print("=" * 68)
 
     dataset = SmolVLAMultimodalDataset(DATA_DIR, window_size=WINDOW_SIZE, chunk_size=CHUNK_SIZE)
@@ -393,7 +410,7 @@ def train(epochs=140, batch_size=256, lr=9e-4):
             elif len(compat) > 0:
                 model_dict.update(compat)
                 model.load_state_dict(model_dict)
-                print(f">> [VLA FINE-TUNING] Transferred {len(compat)}/{len(model_dict)} pretrained backbone layers.")
+                print(f">> [VLA WARM START] Transferred {len(compat)}/{len(model_dict)} layers.")
         except Exception as e:
             print(f">> [INFO] Initializing fresh SmolVLA Transformer.")
 
@@ -411,7 +428,7 @@ def train(epochs=140, batch_size=256, lr=9e-4):
     use_amp = True
     amp_dtype = torch.bfloat16 if (DEVICE.type == 'cpu' and hasattr(torch, 'bfloat16')) else torch.float32
 
-    print(f"\n>> Fine-Tuning Policy across {len(dataset)} samples ({epochs} epochs with AMP)...")
+    print(f"\n>> Training Grounded VLA across {len(dataset)} samples ({epochs} epochs with AMP)...")
 
     best_loss = float('inf')
 
@@ -474,7 +491,7 @@ def train(epochs=140, batch_size=256, lr=9e-4):
         return
 
     torch.save(model.state_dict(), model_path)
-    print(f"\n[SUCCESS] Multimodal SmolVLA Policy saved -> {model_path}")
+    print(f"\n[SUCCESS] Grounded SmolVLA Policy saved -> {model_path}")
 
 if __name__ == "__main__":
     train()
