@@ -7,7 +7,7 @@ import pygame
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "env"))
 from dobot_env import DobotPickPlaceSim, COLOR_PALETTE
-from train_imitation import SmolVLAPolicy, MODEL_DIR, WINDOW_SIZE, CHUNK_SIZE
+from train_imitation import SmolVLA2Policy, SmolVLAPolicy, MODEL_DIR, WINDOW_SIZE, CHUNK_SIZE
 
 def world_to_screen(x, y):
     sx = int(200 + (y / 0.30) * 160)
@@ -116,21 +116,11 @@ def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, mod
 
 def evaluate(episodes=10):
     model_path = os.path.join(MODEL_DIR, "dobot_bc_policy.pth")
-    stats_path = os.path.join(MODEL_DIR, "norm_stats.npz")
-    
-    if not os.path.exists(model_path) or not os.path.exists(stats_path):
-        print("\n [ERROR] Model or stats not found! Train model first.")
+    if not os.path.exists(model_path):
+        print("\n [ERROR] Model not found! Train model first.")
         return
 
-    stats = np.load(stats_path)
-    proprio_mean = stats['proprio_mean']
-    proprio_std = stats['proprio_std']
-    motion_mean = stats['motion_mean']
-    motion_std = stats['motion_std']
-    window_size = int(stats['window_size']) if 'window_size' in stats else WINDOW_SIZE
-    chunk_size = int(stats['chunk_size']) if 'chunk_size' in stats else CHUNK_SIZE
-
-    model = SmolVLAPolicy(chunk_size=chunk_size, d_model=128, nhead=4, num_layers=3)
+    model = SmolVLA2Policy()
     model.load_state_dict(torch.load(model_path, map_location="cpu"))
     model.eval()
 
@@ -138,19 +128,16 @@ def evaluate(episodes=10):
 
     pygame.init()
     screen = pygame.display.set_mode((780, 520))
-    pygame.display.set_caption("Dobot Grounded Clutter Autopilot")
+    pygame.display.set_caption("SmolVLA-2 Neural Policy Evaluator")
     font = pygame.font.SysFont("Arial", 14)
     font_bold = pygame.font.SysFont("Arial", 16, bold=True)
     clock = pygame.time.Clock()
 
     successes = 0
-    max_steps = 180
-
-    exp_weights = np.exp(-0.4 * np.arange(chunk_size))
-    exp_weights = exp_weights / exp_weights.sum()
+    total_steps = 128
 
     print("=" * 68)
-    print("   Testing Grounded Policy with Clutter & Visual Distractors")
+    print("   Testing SmolVLA-2 Neural Policy (Full Neural Trajectory Generation)")
     print("=" * 68)
 
     for ep in range(1, episodes + 1):
@@ -163,74 +150,35 @@ def evaluate(episodes=10):
         print(f">> Target Platform ({sim.target_plat_color.upper()}): [{sim.target_platform_pos[0]:.3f}, {sim.target_platform_pos[1]:.3f}]")
         print(f">> Distractor Cubes: {[c for c, _ in sim.distractor_cubes]}")
         
-        # Ground visual targets directly from overhead camera image and language prompt
-        from train_imitation import parse_target_colors_from_prompt, COLOR_PALETTE_RGB
-        c_col_name, p_col_name = parse_target_colors_from_prompt(prompt_text)
-
-        def locate_color_world(img_chw, color_name, default_pos):
-            col = COLOR_PALETTE_RGB.get(color_name, COLOR_PALETTE_RGB["red"]).reshape(3, 1, 1)
-            diff = np.abs(img_chw - col)
-            mask = (diff[0] < 0.12) & (diff[1] < 0.12) & (diff[2] < 0.12)
-            ys, xs = np.where(mask)
-            if len(xs) == 0:
-                return default_pos
-            mean_py = np.mean(ys)
-            mean_px = np.mean(xs)
-            world_y = (mean_px - 32.0) / 28.0 * 0.28
-            world_x = 0.10 + ((58.0 - mean_py) / 52.0) * 0.25
-            return np.array([world_x, world_y, 0.011], dtype=np.float32)
-
-        c_target = locate_color_world(obs_dict["image"], c_col_name, np.array([0.22, 0.10, 0.011], dtype=np.float32))
-        p_target = locate_color_world(obs_dict["image"], p_col_name, np.array([0.22, -0.10, 0.005], dtype=np.float32))
-
-        def generate_smooth_trajectory(start_pos, target_pos, num_steps):
-            t = np.linspace(0, 1, num_steps)
-            s = 10 * (t**3) - 15 * (t**4) + 6 * (t**5)
-            return np.outer(1 - s, start_pos) + np.outer(s, target_pos)
-
-        hover_z = 0.12
-        p_start = sim.ee_pos[:3].copy()
-        p_hover_cube = np.array([c_target[0], c_target[1], hover_z], dtype=np.float32)
-
-        stages = [
-            (p_start, p_hover_cube, 0.0, 24),
-            (p_hover_cube, np.array([c_target[0], c_target[1], 0.026], dtype=np.float32), 0.0, 18),
-            (np.array([c_target[0], c_target[1], 0.026], dtype=np.float32), np.array([c_target[0], c_target[1], 0.026], dtype=np.float32), 1.0, 6),
-            (np.array([c_target[0], c_target[1], 0.026], dtype=np.float32), p_hover_cube, 1.0, 18),
-            (p_hover_cube, np.array([p_target[0], p_target[1], hover_z], dtype=np.float32), 1.0, 26),
-            (np.array([p_target[0], p_target[1], hover_z], dtype=np.float32), np.array([p_target[0], p_target[1], 0.035], dtype=np.float32), 1.0, 18),
-            (np.array([p_target[0], p_target[1], 0.035], dtype=np.float32), np.array([p_target[0], p_target[1], 0.035], dtype=np.float32), 0.0, 6),
-            (np.array([p_target[0], p_target[1], 0.035], dtype=np.float32), np.array([p_target[0], p_target[1], 0.12], dtype=np.float32), 0.0, 14),
-        ]
+        # Neural Network inference directly on raw RGB image and language instruction:
+        img_t = torch.tensor(obs_dict["image"], dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            pred_traj = model(img_t, prompt_str=[prompt_text]).squeeze(0).numpy() # [128, 4]
 
         ep_success = False
         aborted = False
-        step = 0
-        total_steps = sum(s[3] for s in stages)
 
-        for start_pt, end_pt, grip, num_pts in stages:
-            pts = generate_smooth_trajectory(start_pt, end_pt, num_pts)
-            for pt in pts:
-                step += 1
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        pygame.quit()
-                        return
-                    elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                        aborted = True
-
-                if aborted:
-                    break
-
-                obs_dict, is_succ = sim.step(np.array([pt[0], pt[1], pt[2], 0.0, grip]))
-                if is_succ:
-                    ep_success = True
-
-                render_gui(screen, font, font_bold, sim, ep, episodes, step, total_steps, 0.99, is_succ, obs_dict["image"])
-                time.sleep(0.015)
+        for step in range(total_steps):
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    return
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    aborted = True
 
             if aborted:
                 break
+
+            pt = pred_traj[step]
+            target_xyz = pt[:3]
+            grip_cmd = 1.0 if pt[3] > 0.5 else 0.0
+
+            obs_dict, is_succ = sim.step(np.array([target_xyz[0], target_xyz[1], target_xyz[2], 0.0, grip_cmd]))
+            if is_succ:
+                ep_success = True
+
+            render_gui(screen, font, font_bold, sim, ep, episodes, step + 1, total_steps, 0.99, is_succ, obs_dict["image"])
+            time.sleep(0.015)
 
         if aborted:
             break
