@@ -7,7 +7,7 @@ import pygame
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "env"))
 from dobot_env import DobotPickPlaceSim, COLOR_PALETTE
-from train_imitation import SmolVLA2Policy, SmolVLAPolicy, MODEL_DIR, WINDOW_SIZE, CHUNK_SIZE
+from train_imitation import SmolVLA2Policy, SmolVLAPolicy, MODEL_DIR
 
 def world_to_screen(x, y):
     sx = int(200 + (y / 0.30) * 160)
