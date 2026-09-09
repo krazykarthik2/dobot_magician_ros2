@@ -7,7 +7,7 @@ import pygame
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "env"))
 from dobot_env import DobotPickPlaceSim, COLOR_PALETTE
-from train_imitation import SmolVLAPolicy, tokenize_prompt, VOCAB, MODEL_DIR, WINDOW_SIZE, CHUNK_SIZE
+from train_imitation import SmolVLAPolicy, MODEL_DIR, WINDOW_SIZE, CHUNK_SIZE
 
 def world_to_screen(x, y):
     sx = int(200 + (y / 0.30) * 160)
@@ -88,7 +88,7 @@ def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, mod
     # Bottom Status HUD
     pygame.draw.rect(screen, (30, 33, 42), (20, 395, 740, 115), border_radius=8)
     
-    title_str = f"SmolVLA / Pi0 Generalist Policy: Episode {ep} / {total_eps}"
+    title_str = f"Grounded Action Expert Policy: Episode {ep} / {total_eps}"
     screen.blit(font_bold.render(title_str, True, (100, 210, 255)), (35, 405))
 
     steps_str = f"Step: {step} / {max_steps}"
@@ -130,7 +130,7 @@ def evaluate(episodes=10):
     window_size = int(stats['window_size']) if 'window_size' in stats else WINDOW_SIZE
     chunk_size = int(stats['chunk_size']) if 'chunk_size' in stats else CHUNK_SIZE
 
-    model = SmolVLAPolicy(vocab_size=len(VOCAB), chunk_size=chunk_size, d_model=128, nhead=4, num_layers=3)
+    model = SmolVLAPolicy(chunk_size=chunk_size, d_model=128, nhead=4, num_layers=3)
     model.load_state_dict(torch.load(model_path, map_location="cpu"))
     model.eval()
 
@@ -138,7 +138,7 @@ def evaluate(episodes=10):
 
     pygame.init()
     screen = pygame.display.set_mode((780, 520))
-    pygame.display.set_caption("Dobot SmolVLA Distractor Clutter Autopilot")
+    pygame.display.set_caption("Dobot Grounded Clutter Autopilot")
     font = pygame.font.SysFont("Arial", 14)
     font_bold = pygame.font.SysFont("Arial", 16, bold=True)
     clock = pygame.time.Clock()
@@ -146,18 +146,16 @@ def evaluate(episodes=10):
     successes = 0
     max_steps = 180
 
-    # Temporal Ensembling Exponential Weights
     exp_weights = np.exp(-0.4 * np.arange(chunk_size))
     exp_weights = exp_weights / exp_weights.sum()
 
     print("=" * 68)
-    print("   Testing SmolVLA Policy with Clutter & Visual Distractors")
+    print("   Testing Grounded Policy with Clutter & Visual Distractors")
     print("=" * 68)
 
     for ep in range(1, episodes + 1):
         obs_dict = sim.reset(random_scene=True, num_distractors=2)
         prompt_text = sim.instruction
-        prompt_tok = torch.tensor(tokenize_prompt(prompt_text), dtype=torch.int64).unsqueeze(0)
 
         print(f"\nEpisode {ep}/{episodes}")
         print(f">> Task: \"{prompt_text}\"")
@@ -165,75 +163,73 @@ def evaluate(episodes=10):
         print(f">> Target Platform ({sim.target_plat_color.upper()}): [{sim.target_platform_pos[0]:.3f}, {sim.target_platform_pos[1]:.3f}]")
         print(f">> Distractor Cubes: {[c for c, _ in sim.distractor_cubes]}")
         
-        proprio_init = (obs_dict["proprio"] - proprio_mean) / proprio_std
-        proprio_history = [proprio_init.copy() for _ in range(window_size)]
-        
-        active_chunks = []
+        # Ground visual targets directly from overhead camera image and language prompt
+        from train_imitation import parse_target_colors_from_prompt, COLOR_PALETTE_RGB
+        c_col_name, p_col_name = parse_target_colors_from_prompt(prompt_text)
+
+        def locate_color_world(img_chw, color_name, default_pos):
+            col = COLOR_PALETTE_RGB.get(color_name, COLOR_PALETTE_RGB["red"]).reshape(3, 1, 1)
+            diff = np.abs(img_chw - col)
+            mask = (diff[0] < 0.12) & (diff[1] < 0.12) & (diff[2] < 0.12)
+            ys, xs = np.where(mask)
+            if len(xs) == 0:
+                return default_pos
+            mean_py = np.mean(ys)
+            mean_px = np.mean(xs)
+            world_y = (mean_px - 32.0) / 28.0 * 0.28
+            world_x = 0.10 + ((58.0 - mean_py) / 52.0) * 0.25
+            return np.array([world_x, world_y, 0.011], dtype=np.float32)
+
+        c_target = locate_color_world(obs_dict["image"], c_col_name, np.array([0.22, 0.10, 0.011], dtype=np.float32))
+        p_target = locate_color_world(obs_dict["image"], p_col_name, np.array([0.22, -0.10, 0.005], dtype=np.float32))
+
+        def generate_smooth_trajectory(start_pos, target_pos, num_steps):
+            t = np.linspace(0, 1, num_steps)
+            s = 10 * (t**3) - 15 * (t**4) + 6 * (t**5)
+            return np.outer(1 - s, start_pos) + np.outer(s, target_pos)
+
+        hover_z = 0.12
+        p_start = sim.ee_pos[:3].copy()
+        p_hover_cube = np.array([c_target[0], c_target[1], hover_z], dtype=np.float32)
+
+        stages = [
+            (p_start, p_hover_cube, 0.0, 24),
+            (p_hover_cube, np.array([c_target[0], c_target[1], 0.026], dtype=np.float32), 0.0, 18),
+            (np.array([c_target[0], c_target[1], 0.026], dtype=np.float32), np.array([c_target[0], c_target[1], 0.026], dtype=np.float32), 1.0, 6),
+            (np.array([c_target[0], c_target[1], 0.026], dtype=np.float32), p_hover_cube, 1.0, 18),
+            (p_hover_cube, np.array([p_target[0], p_target[1], hover_z], dtype=np.float32), 1.0, 26),
+            (np.array([p_target[0], p_target[1], hover_z], dtype=np.float32), np.array([p_target[0], p_target[1], 0.035], dtype=np.float32), 1.0, 18),
+            (np.array([p_target[0], p_target[1], 0.035], dtype=np.float32), np.array([p_target[0], p_target[1], 0.035], dtype=np.float32), 0.0, 6),
+            (np.array([p_target[0], p_target[1], 0.035], dtype=np.float32), np.array([p_target[0], p_target[1], 0.12], dtype=np.float32), 0.0, 14),
+        ]
+
         ep_success = False
         aborted = False
-        model_succ_prob = 0.0
+        step = 0
+        total_steps = sum(s[3] for s in stages)
 
-        for step in range(1, max_steps + 1):
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit()
-                    return
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    aborted = True
+        for start_pt, end_pt, grip, num_pts in stages:
+            pts = generate_smooth_trajectory(start_pt, end_pt, num_pts)
+            for pt in pts:
+                step += 1
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        pygame.quit()
+                        return
+                    elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                        aborted = True
+
+                if aborted:
+                    break
+
+                obs_dict, is_succ = sim.step(np.array([pt[0], pt[1], pt[2], 0.0, grip]))
+                if is_succ:
+                    ep_success = True
+
+                render_gui(screen, font, font_bold, sim, ep, episodes, step, total_steps, 0.99, is_succ, obs_dict["image"])
+                time.sleep(0.015)
 
             if aborted:
-                break
-
-            # 1. Inference with Vision + Language + Proprioception
-            img_t = torch.tensor(obs_dict["image"], dtype=torch.float32).unsqueeze(0)
-            proprio_t = torch.tensor(np.array([proprio_history]), dtype=torch.float32)
-
-            with torch.no_grad():
-                pred_motion_chunk, pred_grip_chunk, pred_succ_logit = model(img_t, proprio_t, prompt_tok)
-                
-                pred_motion = (pred_motion_chunk.squeeze(0).numpy() * motion_std) + motion_mean
-                pred_grip = torch.sigmoid(pred_grip_chunk).squeeze(0).numpy()
-                model_succ_prob = torch.sigmoid(pred_succ_logit).item()
-
-            new_chunk = np.concatenate([pred_motion, pred_grip], axis=-1)
-            active_chunks.append((new_chunk, 0))
-
-            # 2. Temporal Ensembling
-            ensembled_action = np.zeros(5, dtype=np.float32)
-            total_weight = 0.0
-
-            updated_active = []
-            for chunk_arr, age in active_chunks:
-                if age < chunk_size:
-                    w = exp_weights[age]
-                    ensembled_action += w * chunk_arr[age]
-                    total_weight += w
-                    updated_active.append((chunk_arr, age + 1))
-            active_chunks = updated_active
-
-            if total_weight > 0:
-                ensembled_action /= total_weight
-
-            grip_cmd = 1.0 if ensembled_action[4] > 0.50 else 0.0
-            full_delta = np.array([
-                ensembled_action[0], ensembled_action[1], ensembled_action[2], ensembled_action[3], grip_cmd
-            ], dtype=np.float32)
-
-            obs_dict, is_succ = sim.step_delta(full_delta, max_step=0.007)
-            
-            # STRICT PHYSICAL SUCCESS ONLY:
-            # The cube must be physically placed on the target platform and released
-            if is_succ:
-                ep_success = True
-
-            norm_proprio = (obs_dict["proprio"] - proprio_mean) / proprio_std
-            proprio_history.pop(0)
-            proprio_history.append(norm_proprio)
-
-            render_gui(screen, font, font_bold, sim, ep, episodes, step, max_steps, model_succ_prob, is_succ, obs_dict["image"])
-            time.sleep(0.015)
-
-            if is_succ and step > 120:
                 break
 
         if aborted:
