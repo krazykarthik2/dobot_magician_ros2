@@ -186,19 +186,12 @@ def evaluate(episodes=10):
         print(f">> Target Platform ({sim.target_plat_color.upper()}): [{sim.target_platform_pos[0]:.3f}, {sim.target_platform_pos[1]:.3f}]")
         print(f">> Distractor Cubes: {[c for c, _ in sim.distractor_cubes]}")
         
-        # Forward pass through model and extract latent token activations
+        # Authentic SmolVLA-2 Forward pass directly from raw RGB image + text prompt string
         img_t = torch.tensor(obs_dict["image"], dtype=torch.float32).unsqueeze(0)
-        from train_imitation import parse_colors
-        c_rgb, p_rgb = parse_colors(prompt_text)
-        c_t = torch.tensor(c_rgb, dtype=torch.float32).unsqueeze(0)
-        p_t = torch.tensor(p_rgb, dtype=torch.float32).unsqueeze(0)
-
         with torch.no_grad():
-            c_diff = torch.norm(img_t - c_t.unsqueeze(-1).unsqueeze(-1), dim=1, keepdim=True)
-            p_diff = torch.norm(img_t - p_t.unsqueeze(-1).unsqueeze(-1), dim=1, keepdim=True)
-            attn = torch.cat([-c_diff, -p_diff], dim=1)
-            latent_kps = model.spatial_softmax(attn).squeeze(0).numpy() # [4]
-            pred_traj = model.decoder(torch.tensor(latent_kps).unsqueeze(0)).view(128, 4).numpy()
+            pred_traj_t, latent_kps_t, attn_maps_t = model(img_t, prompt_str=[prompt_text])
+            pred_traj = pred_traj_t.squeeze(0).numpy()       # [128, 4]
+            latent_kps = latent_kps_t.squeeze(0).numpy()     # [4]
 
         ep_success = False
         aborted = False
