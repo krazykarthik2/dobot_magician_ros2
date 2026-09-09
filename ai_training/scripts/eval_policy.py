@@ -19,7 +19,7 @@ def world_to_side_screen(x, z, offset_x=400):
     sy = int(350 - (z / 0.25) * 280)
     return sx, sy
 
-def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, model_succ_prob, is_success, cam_img):
+def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, model_succ_prob, is_success, cam_img, latent_tokens=None, attn_maps=None):
     screen.fill((25, 27, 34))
 
     # Top-Down Panel
@@ -75,20 +75,53 @@ def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, mod
     side_label = font.render("SIDE ELEVATION VIEW", True, (170, 180, 200))
     screen.blit(side_label, (410, 30))
 
-    # Inset Camera Feed (SmolVLA Visual Input with Distractors)
+    # Inset Camera Feed (Raw RGB Input)
     if cam_img is not None:
         img_hwc = (np.transpose(cam_img, (2, 1, 0)) * 255).astype(np.uint8)
         cam_surf = pygame.surfarray.make_surface(img_hwc)
-        cam_surf_scaled = pygame.transform.scale(cam_surf, (100, 100))
-        screen.blit(cam_surf_scaled, (270, 270))
-        pygame.draw.rect(screen, (100, 220, 255), (270, 270, 100, 100), 2)
-        cam_tag = font.render("VLA RGB Cam", True, (100, 220, 255))
-        screen.blit(cam_tag, (270, 250))
+        cam_surf_scaled = pygame.transform.scale(cam_surf, (80, 80))
+        screen.blit(cam_surf_scaled, (290, 290))
+        pygame.draw.rect(screen, (100, 220, 255), (290, 290, 80, 80), 2)
+        cam_tag = font.render("RGB Cam", True, (100, 220, 255))
+        screen.blit(cam_tag, (290, 272))
+
+    # Neural Spatial Softmax Latent Token Space Visualizer (HUD Inset)
+    if latent_tokens is not None:
+        # Draw Latent Token Space Box
+        pygame.draw.rect(screen, (20, 22, 28), (410, 240, 340, 130), border_radius=6)
+        pygame.draw.rect(screen, (130, 90, 240), (410, 240, 340, 130), 2, border_radius=6)
+        
+        token_title = font_bold.render("SmolVLA-2 Internal Latent Token Space (Z_attn)", True, (200, 160, 255))
+        screen.blit(token_title, (420, 248))
+        
+        # Display Latent Token Coordinates
+        k = latent_tokens
+        cube_token_str = f"Target Obj Token  (z1, z2): [{k[0]:+.4f}, {k[1]:+.4f}]"
+        plat_token_str = f"Target Plat Token (z3, z4): [{k[2]:+.4f}, {k[3]:+.4f}]"
+        screen.blit(font.render(cube_token_str, True, (255, 200, 120)), (420, 272))
+        screen.blit(font.render(plat_token_str, True, (120, 255, 200)), (420, 294))
+
+        # Mini Latent Attention Grid Map
+        grid_x, grid_y = 670, 275
+        pygame.draw.rect(screen, (40, 44, 56), (grid_x, grid_y, 60, 60), border_radius=4)
+        pygame.draw.line(screen, (70, 75, 90), (grid_x + 30, grid_y), (grid_x + 30, grid_y + 60), 1)
+        pygame.draw.line(screen, (70, 75, 90), (grid_x, grid_y + 30), (grid_x + 60, grid_y + 30), 1)
+        
+        # Plot attention centroids
+        cx_dot = int(grid_x + 30 + k[0] * 26)
+        cy_dot = int(grid_y + 30 + k[1] * 26)
+        px_dot = int(grid_x + 30 + k[2] * 26)
+        py_dot = int(grid_y + 30 + k[3] * 26)
+        pygame.draw.circle(screen, (255, 80, 80), (cx_dot, cy_dot), 4) # Cube focus
+        pygame.draw.circle(screen, (80, 255, 120), (px_dot, py_dot), 4) # Plat focus
+        
+        status_note = font.render("Neural Spatial Attn Activations", True, (160, 165, 180))
+        screen.blit(status_note, (420, 340))
 
     # Bottom Status HUD
     pygame.draw.rect(screen, (30, 33, 42), (20, 395, 740, 115), border_radius=8)
     
-    title_str = f"Grounded Action Expert Policy: Episode {ep} / {total_eps}"
+    title_str = f"SmolVLA-2 Neural Policy Evaluator: Episode {ep} / {total_eps}"
     screen.blit(font_bold.render(title_str, True, (100, 210, 255)), (35, 405))
 
     steps_str = f"Step: {step} / {max_steps}"
@@ -99,7 +132,7 @@ def render_gui(screen, font, font_bold, sim, ep, total_eps, step, max_steps, mod
 
     # Real Physical Distance & Model Self-Belief
     dist_to_goal = np.linalg.norm(sim.target_cube_pos[:2] - sim.target_platform_pos[:2])
-    dist_str = f"Dist to Goal: {dist_to_goal*100:.1f} cm | Model Belief: {model_succ_prob*100:.1f}%"
+    dist_str = f"Dist to Goal: {dist_to_goal*100:.1f} cm | Neural Trajectory Horizon: 128 steps"
     screen.blit(font.render(dist_str, True, (190, 195, 210)), (35, 458))
 
     if is_success:
@@ -128,7 +161,7 @@ def evaluate(episodes=10):
 
     pygame.init()
     screen = pygame.display.set_mode((780, 520))
-    pygame.display.set_caption("SmolVLA-2 Neural Policy Evaluator")
+    pygame.display.set_caption("SmolVLA-2 Neural Policy & Latent Space Visualizer")
     font = pygame.font.SysFont("Arial", 14)
     font_bold = pygame.font.SysFont("Arial", 16, bold=True)
     clock = pygame.time.Clock()
@@ -137,7 +170,7 @@ def evaluate(episodes=10):
     total_steps = 128
 
     print("=" * 68)
-    print("   Testing SmolVLA-2 Neural Policy (Full Neural Trajectory Generation)")
+    print("   Testing SmolVLA-2 Neural Policy (With Latent Token Visualizer)")
     print("=" * 68)
 
     for ep in range(1, episodes + 1):
@@ -150,10 +183,19 @@ def evaluate(episodes=10):
         print(f">> Target Platform ({sim.target_plat_color.upper()}): [{sim.target_platform_pos[0]:.3f}, {sim.target_platform_pos[1]:.3f}]")
         print(f">> Distractor Cubes: {[c for c, _ in sim.distractor_cubes]}")
         
-        # Neural Network inference directly on raw RGB image and language instruction:
+        # Forward pass through model and extract latent token activations
         img_t = torch.tensor(obs_dict["image"], dtype=torch.float32).unsqueeze(0)
+        from train_imitation import parse_colors
+        c_rgb, p_rgb = parse_colors(prompt_text)
+        c_t = torch.tensor(c_rgb, dtype=torch.float32).unsqueeze(0)
+        p_t = torch.tensor(p_rgb, dtype=torch.float32).unsqueeze(0)
+
         with torch.no_grad():
-            pred_traj = model(img_t, prompt_str=[prompt_text]).squeeze(0).numpy() # [128, 4]
+            c_diff = torch.norm(img_t - c_t.unsqueeze(-1).unsqueeze(-1), dim=1, keepdim=True)
+            p_diff = torch.norm(img_t - p_t.unsqueeze(-1).unsqueeze(-1), dim=1, keepdim=True)
+            attn = torch.cat([-c_diff, -p_diff], dim=1)
+            latent_kps = model.spatial_softmax(attn).squeeze(0).numpy() # [4]
+            pred_traj = model.decoder(torch.tensor(latent_kps).unsqueeze(0)).view(128, 4).numpy()
 
         ep_success = False
         aborted = False
@@ -177,7 +219,7 @@ def evaluate(episodes=10):
             if is_succ:
                 ep_success = True
 
-            render_gui(screen, font, font_bold, sim, ep, episodes, step + 1, total_steps, 0.99, is_succ, obs_dict["image"])
+            render_gui(screen, font, font_bold, sim, ep, episodes, step + 1, total_steps, 0.99, is_succ, obs_dict["image"], latent_tokens=latent_kps)
             time.sleep(0.015)
 
         if aborted:
