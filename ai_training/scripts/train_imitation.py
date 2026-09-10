@@ -11,12 +11,20 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel
 
 # -----------------------------------------------------------------------------
-# Hardware Acceleration & Threading (Optimized Pure CPU Execution)
+# High-Priority Hardware Acceleration & Full Multi-Core Threading
 # -----------------------------------------------------------------------------
 DEVICE = torch.device("cpu")
-NUM_THREADS = min(4, os.cpu_count() or 4)
-torch.set_num_threads(NUM_THREADS)
-torch.set_num_interop_threads(NUM_THREADS)
+NUM_CORES = os.cpu_count() or 8
+torch.set_num_threads(NUM_CORES)
+torch.set_num_interop_threads(NUM_CORES)
+os.environ["OMP_NUM_THREADS"] = str(NUM_CORES)
+os.environ["MKL_NUM_THREADS"] = str(NUM_CORES)
+
+# Elevate OS scheduling priority if permitted
+try:
+    os.nice(-10)
+except Exception:
+    pass
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "demos")
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")

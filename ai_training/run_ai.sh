@@ -31,8 +31,8 @@ case "$CHOICE" in
         python3 "$DIR/scripts/teleop_recorder.py"
         ;;
     3)
-        echo ">> Starting CPU Imitation Learning Training..."
-        python3 "$DIR/scripts/train_imitation.py"
+        echo ">> Starting High-Priority CPU Imitation Learning Training..."
+        nice -n -10 python3 "$DIR/scripts/train_imitation.py" 2>/dev/null || python3 "$DIR/scripts/train_imitation.py"
         ;;
     4)
         echo ">> Running AI Autopilot Evaluation on Random Cubes..."
