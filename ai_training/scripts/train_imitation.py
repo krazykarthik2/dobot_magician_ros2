@@ -230,6 +230,8 @@ SmolVLAPolicy = TrueSmolVLAPolicy
 DobotActionChunkTransformer = TrueSmolVLAPolicy
 TrueSmolVLADataset = OTFlowMatchingDataset
 
+from tqdm import tqdm
+
 # -----------------------------------------------------------------------------
 # 3. CPU-Fast Optimal Transport Flow-Matching Training Routine
 # -----------------------------------------------------------------------------
@@ -256,7 +258,8 @@ def train(epochs=350, batch_size=16, lr=1.8e-3):
     best_loss = float('inf')
 
     try:
-        for epoch in range(1, epochs + 1):
+        epoch_pbar = tqdm(range(1, epochs + 1), desc="Training SmolVLA-2 (OT-CFM)", unit="epoch", dynamic_ncols=True)
+        for epoch in epoch_pbar:
             model.train()
             total_loss = 0.0
 
@@ -290,11 +293,15 @@ def train(epochs=350, batch_size=16, lr=1.8e-3):
                 best_loss = min(best_loss, avg_loss)
                 torch.save(model.state_dict(), model_path)
 
-            if epoch % 50 == 0 or epoch == 1 or epoch == epochs:
-                print(f"Epoch [{epoch:03d}/{epochs}] - OT-CFM Loss: {avg_loss:.6f} | LR: {scheduler.get_last_lr()[0]:.6f}", flush=True)
+            current_lr = scheduler.get_last_lr()[0]
+            epoch_pbar.set_postfix({
+                "OT_Loss": f"{avg_loss:.5f}",
+                "Best": f"{best_loss:.5f}",
+                "LR": f"{current_lr:.6f}"
+            })
 
     except KeyboardInterrupt:
-        print("\n[INFO] Saving checkpoint...", flush=True)
+        print("\n[INFO] Training interrupted by user. Saving checkpoint...", flush=True)
         torch.save(model.state_dict(), model_path)
         return
 
